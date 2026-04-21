@@ -162,8 +162,10 @@ class MainWindow(QMainWindow):
         self._preview_clip_id: str = ""
         self._region_export_range: tuple[float, float] | None = None
 
-        # Undo stack — each entry is a full state snapshot (see _snapshot).
+        # Undo / redo stacks — each entry is a full state snapshot. A new
+        # snapshot (user action) clears the redo stack, same as Photoshop.
         self._undo_stack: list[dict] = []
+        self._redo_stack: list[dict] = []
         self._undo_limit: int = 80
 
         self._build_ui()
@@ -175,11 +177,33 @@ class MainWindow(QMainWindow):
     # --- shortcuts -----------------------------------------------------
 
     def _install_shortcuts(self) -> None:
-        undo = QShortcut(QKeySequence.Undo, self)
-        undo.activated.connect(self._undo)
+        QShortcut(QKeySequence.Undo, self).activated.connect(self._undo)
+        QShortcut(QKeySequence.Redo, self).activated.connect(self._redo)
+        # Ctrl+Y as an explicit redo binding — QKeySequence.Redo is
+        # Ctrl+Shift+Z on some platforms, Ctrl+Y on others.
+        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self._redo)
         space = QShortcut(QKeySequence(Qt.Key_Space), self)
         space.setContext(Qt.ApplicationShortcut)
         space.activated.connect(self._toggle_play)
+        # Frame step.
+        QShortcut(QKeySequence(Qt.Key_Period), self).activated.connect(self._next_frame)
+        QShortcut(QKeySequence(Qt.Key_Comma), self).activated.connect(self._prev_frame)
+        # Jump to clip edges / sequence ends.
+        QShortcut(QKeySequence(Qt.Key_Home), self).activated.connect(
+            lambda: self.timeline.set_playhead(0.0),
+        )
+        QShortcut(QKeySequence(Qt.Key_End), self).activated.connect(
+            lambda: self.timeline.set_playhead(self._total_playback_length()),
+        )
+        QShortcut(QKeySequence(Qt.Key_BracketLeft), self).activated.connect(self._jump_selected_clip_start)
+        QShortcut(QKeySequence(Qt.Key_BracketRight), self).activated.connect(self._jump_selected_clip_end)
+        QShortcut(QKeySequence("Alt+,"), self).activated.connect(self._jump_prev_clip_edge)
+        QShortcut(QKeySequence("Alt+."), self).activated.connect(self._jump_next_clip_edge)
+        # Merge adjacent clips.
+        QShortcut(QKeySequence(Qt.Key_M), self).activated.connect(self._merge_with_next_clip)
+        # Esc cancels crop mode.
+        esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        esc.activated.connect(self._on_escape_pressed)
 
     # --- scrollbar glue ------------------------------------------------
 
@@ -199,11 +223,10 @@ class MainWindow(QMainWindow):
             sb.setValue(v)
             sb.blockSignals(False)
 
-    # --- undo ---------------------------------------------------------
+    # --- undo / redo --------------------------------------------------
 
-    def _snapshot(self) -> None:
-        """Push the current editable state onto the undo stack."""
-        snap = {
+    def _current_state_snap(self) -> dict:
+        return {
             "clips": [c.clone() for c in self._clips],
             "selected_id": self.timeline.selected_id() if hasattr(self, "timeline") else "",
             "playhead": self.timeline.playhead() if hasattr(self, "timeline") else 0.0,
@@ -212,18 +235,18 @@ class MainWindow(QMainWindow):
             "added_gain": self.audio_gain.value() if hasattr(self, "audio_gain") else 1.0,
             "orig_gain": self.orig_gain.value() if hasattr(self, "orig_gain") else 1.0,
         }
-        self._undo_stack.append(snap)
+
+    def _snapshot(self) -> None:
+        """Record the current state as an undo point. Any queued redo
+        entries are discarded because we're branching off a new action."""
+        self._undo_stack.append(self._current_state_snap())
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack.pop(0)
+        self._redo_stack.clear()
 
-    def _undo(self) -> None:
-        if not self._undo_stack:
-            self.status.showMessage("Nothing to undo.", 2000)
-            return
-        snap = self._undo_stack.pop()
+    def _apply_state(self, snap: dict) -> None:
         self._clips = [c.clone() for c in snap["clips"]]
         self._restore_added_audios(snap.get("added_audios", []))
-        # restore UI-bound settings without retriggering _snapshot
         for w, val in (
             (self.audio_replace_cb, snap["replace_audio"]),
         ):
@@ -242,7 +265,6 @@ class MainWindow(QMainWindow):
             self.timeline.select_clip(sid)
         self.timeline.set_playhead(snap["playhead"], emit=False)
 
-        # pick a sensible preview clip (first surviving one, or selected)
         preview = next((c for c in self._clips if c.id == sid), None)
         if preview is None and self._clips:
             preview = self._clips[0]
@@ -255,7 +277,29 @@ class MainWindow(QMainWindow):
         self._sync_selected_clip_ui()
         self._update_range_label()
         self._update_controls_enabled()
+        # Re-sync the main player so the preview shows the right frame at
+        # the restored playhead, not a stale one from before the undo.
+        self._drive_main_player_from_playhead()
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            self.status.showMessage("Nothing to undo.", 2000)
+            return
+        self._redo_stack.append(self._current_state_snap())
+        snap = self._undo_stack.pop()
+        self._apply_state(snap)
         self.status.showMessage("Undone.", 1500)
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            self.status.showMessage("Nothing to redo.", 2000)
+            return
+        self._undo_stack.append(self._current_state_snap())
+        if len(self._undo_stack) > self._undo_limit:
+            self._undo_stack.pop(0)
+        snap = self._redo_stack.pop()
+        self._apply_state(snap)
+        self.status.showMessage("Redone.", 1500)
 
     # --- UI construction ----------------------------------------------
 
@@ -323,6 +367,15 @@ class MainWindow(QMainWindow):
         self._play_timer.timeout.connect(self._on_play_tick)
         self._play_last_wall: float = 0.0
 
+        # Throttle scrub seeks so rapid dragging doesn't queue up decoder
+        # work faster than it can keep up. `_flush_pending_seek` guarantees
+        # the last position lands even after the user stops moving.
+        self._seek_throttle_timer = QTimer(self)
+        self._seek_throttle_timer.setSingleShot(True)
+        self._seek_throttle_timer.timeout.connect(self._flush_pending_seek)
+        self._pending_seek_ms: int | None = None
+        self._last_seek_wall: float = 0.0
+
         # One QMediaPlayer per added-audio entry (populated lazily in
         # `_append_added_audio`). Each plays once for its natural duration
         # inside its placement range and then pauses (no looping).
@@ -343,8 +396,11 @@ class MainWindow(QMainWindow):
         self.play_btn.setText("Play")
         self.play_btn.clicked.connect(self._toggle_play)
         self.split_btn = QPushButton("Split")
-        self.split_btn.setToolTip("Split the clip under the playhead")
+        self.split_btn.setToolTip("Split the clip under the playhead (S)")
         self.split_btn.clicked.connect(self._split_at_playhead)
+        self.merge_btn = QPushButton("Merge")
+        self.merge_btn.setToolTip("Merge the selected clip with the next one if they came from the same source (M)")
+        self.merge_btn.clicked.connect(self._merge_with_next_clip)
         self.delete_clip_btn = QPushButton("Delete clip")
         self.delete_clip_btn.clicked.connect(self._delete_selected_clip)
         self.crop_btn = QPushButton("Crop")
@@ -359,6 +415,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.play_btn)
         transport.addSpacing(8)
         transport.addWidget(self.split_btn)
+        transport.addWidget(self.merge_btn)
         transport.addWidget(self.delete_clip_btn)
         transport.addSpacing(8)
         transport.addWidget(self.crop_btn)
@@ -598,8 +655,16 @@ class MainWindow(QMainWindow):
         self._kick_off_thumbs(clip)
         if asset.has_audio:
             self._kick_off_waveform(clip)
+        # For the very first clip, move the playhead onto it so the preview
+        # actually shows the first frame instead of staying black at t=0 in
+        # an area that may or may not contain the new clip.
+        if len(self._clips) == 1:
+            self.timeline.set_playhead(clip.timeline_start)
         if not self._preview_clip_id:
             self._set_preview_clip(clip)
+        # Refresh the preview so the video item is visible + positioned on
+        # the right frame as soon as the clip lands on the timeline.
+        self._drive_main_player_from_playhead()
         self._sync_selected_clip_ui()
         self._update_range_label()
         self._update_controls_enabled()
@@ -658,7 +723,11 @@ class MainWindow(QMainWindow):
         self._update_audio_volumes()
 
     def _kick_off_thumbs(self, clip: Clip) -> None:
-        thread, worker = start_thumbnails(clip.id, clip.path, clip.asset.duration, count=24)
+        # More thumbs for longer clips so the strip actually shows the scene
+        # changing. Capped so import time stays tolerable.
+        dur = max(1.0, clip.asset.duration)
+        count = max(16, min(60, int(dur)))
+        thread, worker = start_thumbnails(clip.id, clip.path, clip.asset.duration, count=count)
         worker.finished.connect(self._on_thumbs_ready, Qt.QueuedConnection)
         worker.failed.connect(self._on_thumb_error, Qt.QueuedConnection)
         thread.finished.connect(
@@ -710,6 +779,67 @@ class MainWindow(QMainWindow):
 
     def _on_waveform_error(self, _clip_id: str, _msg: str) -> None:
         pass
+
+    # --- navigation helpers ------------------------------------------
+
+    def _current_fps(self) -> float:
+        c = self._current_preview_clip()
+        if c is None:
+            c = self._clips[0] if self._clips else None
+        if c is not None and c.asset.fps > 0:
+            return float(c.asset.fps)
+        return 30.0
+
+    def _step_playhead(self, delta_s: float) -> None:
+        if self._play_timer.isActive():
+            # Pause so the stepped frame actually stays visible.
+            self._toggle_play()
+        t = self.timeline.playhead() + delta_s
+        t = max(0.0, min(self._total_playback_length(), t))
+        self.timeline.set_playhead(t)
+
+    def _next_frame(self) -> None:
+        self._step_playhead(1.0 / self._current_fps())
+
+    def _prev_frame(self) -> None:
+        self._step_playhead(-1.0 / self._current_fps())
+
+    def _jump_selected_clip_start(self) -> None:
+        c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
+        if c is not None:
+            self.timeline.set_playhead(c.timeline_start)
+        else:
+            self.timeline.set_playhead(0.0)
+
+    def _jump_selected_clip_end(self) -> None:
+        c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
+        if c is not None:
+            self.timeline.set_playhead(max(0.0, c.timeline_end - 1e-3))
+        else:
+            self.timeline.set_playhead(self._total_playback_length())
+
+    def _all_clip_edges(self) -> list[float]:
+        edges = [0.0, self._total_playback_length()]
+        for c in self._clips:
+            edges.append(c.timeline_start)
+            edges.append(c.timeline_end)
+        return sorted(set(edges))
+
+    def _jump_prev_clip_edge(self) -> None:
+        t = self.timeline.playhead()
+        prev = [e for e in self._all_clip_edges() if e < t - 1e-3]
+        if prev:
+            self.timeline.set_playhead(prev[-1])
+
+    def _jump_next_clip_edge(self) -> None:
+        t = self.timeline.playhead()
+        nxt = [e for e in self._all_clip_edges() if e > t + 1e-3]
+        if nxt:
+            self.timeline.set_playhead(nxt[0])
+
+    def _on_escape_pressed(self) -> None:
+        if self.crop_btn.isChecked():
+            self.crop_btn.setChecked(False)
 
     # --- selection / editing -----------------------------------------
 
@@ -783,6 +913,42 @@ class MainWindow(QMainWindow):
         self.timeline.set_clips(self._clips)
         self.timeline.select_clip(new.id)
         self._sync_selected_clip_ui()
+        # Keep the preview on the correct frame at the playhead, not on
+        # stale video from before the split.
+        self._drive_main_player_from_playhead()
+
+    def _merge_with_next_clip(self) -> None:
+        """Inverse of split — merge the selected clip with the next one when
+        they came from the same asset with continuous source/timeline
+        endpoints (i.e. a previous split)."""
+        c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
+        if c is None:
+            self.status.showMessage("Select a clip to merge.", 3000)
+            return
+        ordered = sort_clips(self._clips)
+        idx = next((i for i, cc in enumerate(ordered) if cc.id == c.id), -1)
+        if idx < 0 or idx + 1 >= len(ordered):
+            self.status.showMessage("No clip to merge into on the right.", 3000)
+            return
+        nxt = ordered[idx + 1]
+        if (
+            nxt.asset.id != c.asset.id
+            or abs(c.src_end - nxt.src_start) > 0.05
+            or abs(c.timeline_end - nxt.timeline_start) > 0.05
+            or abs(c.speed - nxt.speed) > 1e-3
+        ):
+            self.status.showMessage(
+                "Can only merge adjacent clips from the same source.", 3500,
+            )
+            return
+        self._snapshot()
+        c.src_end = nxt.src_end
+        self._clips = [cc for cc in self._clips if cc.id != nxt.id]
+        self.timeline.set_clips(self._clips)
+        self.timeline.select_clip(c.id)
+        self._drive_main_player_from_playhead()
+        self._update_range_label()
+        self.status.showMessage("Clips merged.", 2500)
 
     def _delete_selected_clip(self) -> None:
         c = self._selected_clip()
@@ -1089,14 +1255,41 @@ class MainWindow(QMainWindow):
     def _on_timeline_playhead(self, t: float) -> None:
         c = clip_at_timeline(self._clips, t)
         if c is None:
+            # Playhead moved into a gap or past the last clip — hide the
+            # video item so the preview goes black instead of freezing on
+            # a stale frame.
+            self.video_view.set_video_visible(False)
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.player.pause()
+            self._sync_added_audio_playback()
+            self._sync_clip_audio_playback()
             return
         if c.id != self._preview_clip_id:
             self._set_preview_clip(c)
             self.timeline.select_clip(c.id)
+        self.video_view.set_video_visible(True)
         src_t = c.src_for_timeline(t)
-        self.player.setPosition(int(src_t * 1000))
+        target_ms = int(src_t * 1000)
+        now = time.monotonic()
+        # Throttle: if we seeked recently, buffer the target and flush on a
+        # short delay so the final position always lands.
+        if now - self._last_seek_wall < 0.06:
+            self._pending_seek_ms = target_ms
+            if not self._seek_throttle_timer.isActive():
+                self._seek_throttle_timer.start(80)
+        else:
+            self.player.setPosition(target_ms)
+            self._last_seek_wall = now
+            self._pending_seek_ms = None
         self._sync_added_audio_playback()
         self._sync_clip_audio_playback()
+
+    def _flush_pending_seek(self) -> None:
+        if self._pending_seek_ms is None:
+            return
+        self.player.setPosition(self._pending_seek_ms)
+        self._last_seek_wall = time.monotonic()
+        self._pending_seek_ms = None
 
     def _update_range_label(self) -> None:
         total = sequence_length(self._clips)
@@ -1497,7 +1690,7 @@ class MainWindow(QMainWindow):
         # audio-only sequences are valid too.
         self.play_btn.setEnabled(loaded or bool(self._added_audios))
         for w in (
-            self.split_btn, self.delete_clip_btn,
+            self.split_btn, self.merge_btn, self.delete_clip_btn,
             self.crop_btn, self.format_combo, self.export_btn,
         ):
             w.setEnabled(loaded)
