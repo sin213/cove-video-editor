@@ -126,7 +126,7 @@ installs needed.
 | Play / pause                        | `Space`                                 |
 | Next / previous frame               | `.` / `,`                               |
 | Split at playhead                   | `S`                                     |
-| Merge selected clip with next       | `M`                                     |
+| Merge selected clip with next / previous | `M` / `Shift+M`                    |
 | Jump to selected clip start / end   | `[` / `]`                               |
 | Previous / next clip edge           | `Alt+,` / `Alt+.`                       |
 | Jump to sequence start / end        | `Home` / `End`                          |

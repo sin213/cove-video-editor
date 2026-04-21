@@ -504,22 +504,20 @@ class TimelineWidget(QWidget):
                 p.drawText(r_vis, Qt.AlignCenter, label)
                 continue
 
-            # Background tint — linked vs. unlinked.
-            p.fillRect(r_vis, QColor("#16263a") if not c.linked_audio else QColor("#0d1622"))
+            # Linked and unlinked clip audio share the same visual
+            # treatment — only the chain chip differentiates the two. The
+            # selection outline colour still communicates what's selected.
+            p.fillRect(r_vis, QColor("#0d1622"))
 
             if c.waveform_peaks and c.waveform_rate > 0:
-                wave_color = QColor("#5fb4ff") if c.linked_audio else QColor("#ffb067")
-                self._draw_clip_waveform(p, c, r, r_vis, wave_color)
+                self._draw_clip_waveform(p, c, r, r_vis, QColor("#5fb4ff"))
 
             audio_selected = c.id == self._selected_audio_clip_id
             if audio_selected:
-                color = "#ffd38a"
+                color = "#ffd38a"  # dragged/selected unlinked audio
                 width = 2
             elif c.id == self._selected_id:
                 color = "#5fb4ff"
-                width = 2
-            elif not c.linked_audio:
-                color = "#ffb067"
                 width = 2
             else:
                 color = "#2a3a52"
@@ -997,6 +995,10 @@ class TimelineWidget(QWidget):
             c = self._find(self._drag.clip_id)
             if c is not None and self._drag.moved:
                 new_audio_start = max(0.0, t - self._drag.grab_offset_s)
+                new_audio_start = self._snap_audio_start(
+                    new_audio_start, c.timeline_length,
+                    ignore_clip_id=c.id,
+                )
                 c.audio_offset = new_audio_start - c.timeline_start
                 self.update()
         elif self._drag.mode == "move_added":
@@ -1006,7 +1008,14 @@ class TimelineWidget(QWidget):
                     None,
                 )
                 if audio is not None:
-                    audio.offset = max(0.0, t - self._drag.grab_offset_s)
+                    new_offset = max(0.0, t - self._drag.grab_offset_s)
+                    audio.offset = self._snap_audio_start(
+                        new_offset, audio.duration, ignore_audio_id=audio.id,
+                    )
+                    # Vertical drag switches between Audio Track 1 and 2.
+                    new_lane = self._lane_for_y(pos.y())
+                    if new_lane != audio.lane:
+                        audio.lane = new_lane
                     self.update()
         elif self._drag.mode == "resize_tracks":
             dy = pos.y() - self._drag.press_y
@@ -1127,18 +1136,54 @@ class TimelineWidget(QWidget):
     def _snap_clip_start(self, moved: Clip, new_start: float) -> float:
         """Snap moved clip's start/end to other clip edges, t=0, and the
         playhead within 10px."""
-        tolerance_s = 10.0 / max(1.0, self._pps)
+        return self._snap_to_candidates(
+            new_start, moved.timeline_length,
+            self._timeline_snap_candidates(ignore_clip_id=moved.id),
+        )
+
+    def _snap_audio_start(
+        self, new_start: float, length: float, *,
+        ignore_audio_id: str = "", ignore_clip_id: str = "",
+    ) -> float:
+        """Snap a dragged audio block's start/end to clip/audio edges, t=0,
+        and the playhead."""
+        return self._snap_to_candidates(
+            new_start, length,
+            self._timeline_snap_candidates(
+                ignore_clip_id=ignore_clip_id,
+                ignore_audio_id=ignore_audio_id,
+            ),
+        )
+
+    def _timeline_snap_candidates(
+        self, *, ignore_clip_id: str = "", ignore_audio_id: str = "",
+    ) -> list[float]:
         candidates: list[float] = [0.0, self._playhead]
         for c in self._clips:
-            if c.id == moved.id:
+            if c.id == ignore_clip_id:
                 continue
             candidates.append(c.timeline_start)
             candidates.append(c.timeline_end)
-        length = moved.timeline_length
-        # consider snapping the moved clip's start AND its end
+            # Also consider the clip's audio placement when it's been
+            # detached — that's where its audio edges physically sit.
+            if not c.linked_audio and c.asset.has_audio and not c.audio_removed:
+                candidates.append(c.timeline_start + c.audio_offset)
+                candidates.append(c.timeline_end + c.audio_offset)
+        for a in self._added_audios:
+            if a.id == ignore_audio_id:
+                continue
+            candidates.append(a.offset)
+            candidates.append(a.offset + a.duration)
+        return candidates
+
+    def _snap_to_candidates(
+        self, new_start: float, length: float, candidates: list[float],
+    ) -> float:
+        tolerance_s = 10.0 / max(1.0, self._pps)
         best_start = new_start
         best_d = tolerance_s
         for cand in candidates:
+            # Snap both the start and end of the moved block.
             for anchor in (cand, cand - length):
                 d = abs(anchor - new_start)
                 if d < best_d:
