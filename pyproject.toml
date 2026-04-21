@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cove-video-editor"
+version = "1.0.0"
+description = "Lightweight offline video editor: multi-clip timeline, dual audio tracks, trim / split / crop / region-delete, multi-format export"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Cove" }]
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.scripts]
+cove-video-editor = "cove_video_editor.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cove_video_editor = ["assets/*.png", "assets/*.ico"]
