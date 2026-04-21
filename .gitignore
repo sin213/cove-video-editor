@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.buildenv/
+build/
+dist/
+release/
+*.spec
+.DS_Store
+cove_icon.ico

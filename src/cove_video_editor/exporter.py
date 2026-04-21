@@ -1,0 +1,400 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QThread, Signal
+
+from . import ffmpeg_utils as ff
+from .clip import Clip, sequence_length, sort_clips
+
+
+if os.name == "nt":
+    _CREATE_NO_WINDOW = 0x08000000
+    _POPEN_KWARGS: dict = {"creationflags": _CREATE_NO_WINDOW}
+else:
+    _POPEN_KWARGS = {}
+
+
+@dataclass
+class AudioTrack:
+    path: Path
+    replace: bool = False
+    volume: float = 1.0
+    original_volume: float = 1.0
+    offset: float = 0.0          # timeline seconds where the track starts
+    duration: float = 0.0        # natural length; 0 means "use full input"
+
+
+@dataclass
+class ExportJob:
+    clips: list[Clip]
+    output: Path
+    fmt_key: str
+    crop: tuple[int, int, int, int] | None = None
+    width: int | None = None
+    height: int | None = None
+    fps: int | None = None
+    # List of added-audio tracks; each placed at its own offset and mixed
+    # with the clip audio (or replacing it if `replace` is true on all
+    # tracks; the final flag wins).
+    audio_tracks: list[AudioTrack] = field(default_factory=list)
+    # Optional region restriction — if set, only [region_start, region_end)
+    # of the timeline is exported (via output-side -ss / -t on the final map).
+    region_start: float | None = None
+    region_end: float | None = None
+
+    @property
+    def total_timeline(self) -> float:
+        return sequence_length(self.clips)
+
+
+class ExportWorker(QObject):
+    progress = Signal(int)
+    eta = Signal(float)
+    log = Signal(str)
+    finished = Signal(Path)
+    failed = Signal(str)
+
+    def __init__(self, job: ExportJob) -> None:
+        super().__init__()
+        self._job = job
+        self._cancelled = False
+        self._proc: subprocess.Popen | None = None
+        self._started_wall: float = 0.0
+        self._eta_smoothed: float | None = None
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+
+    def run(self) -> None:
+        self._started_wall = time.monotonic()
+        try:
+            cmd = self._build_command()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        self.log.emit("$ " + " ".join(cmd))
+        try:
+            self._execute(cmd)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+            return
+        if self._cancelled:
+            self.failed.emit("Cancelled")
+            return
+        self.finished.emit(self._job.output)
+
+    # --- build --------------------------------------------------------
+
+    def _build_command(self) -> list[str]:
+        job = self._job
+        clips = sort_clips(job.clips)
+        if not clips:
+            raise RuntimeError("no clips to export")
+
+        spec = ff.EXPORT_FORMATS.get(job.fmt_key)
+        if spec is None:
+            raise RuntimeError(f"unknown format {job.fmt_key!r}")
+
+        # Build the list of segments on the timeline: either a clip, or a gap
+        # (black + silent). Gaps between clips are filled with `color` /
+        # `anullsrc` sources so concat matches.
+        timeline_end = sequence_length(clips)
+        segments = _segments_with_gaps(clips, timeline_end)
+
+        is_audio_only = spec["vcodec"] is None
+        needs_audio = spec["acodec"] is not None
+
+        # Output size: honor crop, else take from first real clip, else 1280x720
+        first_real = next((c for c in clips if c.asset.width > 0), None)
+        if job.crop:
+            _, _, tgt_w, tgt_h = job.crop
+        elif job.width and job.height:
+            tgt_w, tgt_h = job.width, job.height
+        elif first_real:
+            tgt_w, tgt_h = first_real.asset.width, first_real.asset.height
+        else:
+            tgt_w, tgt_h = 1280, 720
+        tgt_w -= tgt_w % 2
+        tgt_h -= tgt_h % 2
+
+        cmd: list[str] = [ff.require_ffmpeg(), "-y", "-hide_banner",
+                          "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
+
+        # one -i per real clip; gaps are synthesized inside filter_complex
+        clip_inputs: dict[str, int] = {}
+        for c in clips:
+            clip_inputs[c.id] = len(clip_inputs)
+            cmd += ["-i", str(c.path)]
+
+        # One -i per added-audio track. Parallel list of ffmpeg input indices
+        # so the filter graph can reference them.
+        add_track_indices: list[int] = []
+        for track in job.audio_tracks:
+            add_track_indices.append(len(clip_inputs) + len(add_track_indices))
+            cmd += ["-i", str(track.path)]
+
+        filter_complex, v_label, a_label = self._build_filtergraph(
+            segments, clip_inputs, add_track_indices,
+            tgt_w=tgt_w, tgt_h=tgt_h,
+            is_audio_only=is_audio_only, needs_audio=needs_audio,
+        )
+        cmd += ["-filter_complex", filter_complex]
+
+        if not is_audio_only:
+            cmd += ["-map", f"[{v_label}]"]
+        if needs_audio and a_label is not None:
+            cmd += ["-map", f"[{a_label}]"]
+
+        # region export (output-side trim — cheap and precise)
+        if job.region_start is not None and job.region_end is not None:
+            cmd += [
+                "-ss", f"{max(0.0, job.region_start):.3f}",
+                "-t",  f"{max(0.01, job.region_end - job.region_start):.3f}",
+            ]
+
+        if spec["vcodec"]:
+            cmd += ["-c:v", spec["vcodec"]]
+            if spec["vcodec"] == "libx264":
+                cmd += ["-crf", "20", "-preset", "medium"]
+            elif spec["vcodec"] == "libx265":
+                cmd += ["-crf", "24", "-preset", "medium"]
+            if job.fps:
+                cmd += ["-r", str(job.fps)]
+        if needs_audio and spec["acodec"]:
+            cmd += ["-c:a", spec["acodec"]]
+            if spec["acodec"] == "aac":
+                cmd += ["-b:a", "192k"]
+        cmd += list(spec.get("extra", []))
+        cmd.append(str(job.output))
+        return cmd
+
+    def _build_filtergraph(
+        self,
+        segments: list[tuple[str, float, float, Clip | None]],
+        clip_inputs: dict[str, int],
+        add_track_indices: list[int],
+        *, tgt_w: int, tgt_h: int,
+        is_audio_only: bool, needs_audio: bool,
+    ) -> tuple[str, str, str | None]:
+        job = self._job
+        parts: list[str] = []
+        v_labels: list[str] = []
+        a_labels: list[str] = []
+
+        for i, (kind, seg_start, seg_end, clip) in enumerate(segments):
+            seg_dur = max(0.01, seg_end - seg_start)
+            if kind == "clip":
+                c = clip
+                assert c is not None
+                inp = clip_inputs[c.id]
+                if not is_audio_only:
+                    vchain = [f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}", "setpts=PTS-STARTPTS"]
+                    if job.crop:
+                        x, y, w, h = job.crop
+                        vchain.append(f"crop={w}:{h}:{x}:{y}")
+                    vchain.append(
+                        f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
+                        f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                    )
+                    if abs(c.speed - 1.0) > 1e-6:
+                        vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
+                    parts.append(f"[{inp}:v]" + ",".join(vchain) + f"[v{i}]")
+                    v_labels.append(f"v{i}")
+                if needs_audio:
+                    if (
+                        c.asset.has_audio and not c.muted and c.linked_audio
+                        and not c.audio_removed
+                    ):
+                        achain = [f"atrim=start={c.src_start:.3f}:end={c.src_end:.3f}",
+                                  "asetpts=PTS-STARTPTS"]
+                        if abs(c.speed - 1.0) > 1e-6:
+                            achain.append(f"atempo={_atempo_chain(c.speed)}")
+                        parts.append(f"[{inp}:a]" + ",".join(achain) + f"[a{i}]")
+                    else:
+                        parts.append(
+                            f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                            f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS[a{i}]"
+                        )
+                    a_labels.append(f"a{i}")
+            else:  # gap
+                if not is_audio_only:
+                    parts.append(
+                        f"color=c=black:s={tgt_w}x{tgt_h}:d={seg_dur:.3f}:r=30,"
+                        f"format=yuv420p[v{i}]"
+                    )
+                    v_labels.append(f"v{i}")
+                if needs_audio:
+                    parts.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                        f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS[a{i}]"
+                    )
+                    a_labels.append(f"a{i}")
+
+        # concat across all segments
+        n = len(segments)
+        if n == 0:
+            raise RuntimeError("empty timeline")
+
+        v_out: str | None = None
+        a_out: str | None = None
+        if not is_audio_only:
+            v_in = "".join(f"[{lbl}]" for lbl in v_labels)
+            if needs_audio:
+                a_in = "".join(f"[{lbl}]" for lbl in a_labels)
+                parts.append(f"{v_in}{a_in}concat=n={n}:v=1:a=1[vc][ac]")
+                v_out, a_out = "vc", "ac"
+            else:
+                parts.append(f"{v_in}concat=n={n}:v=1:a=0[vc]")
+                v_out = "vc"
+        else:
+            a_in = "".join(f"[{lbl}]" for lbl in a_labels)
+            parts.append(f"{a_in}concat=n={n}:v=0:a=1[ac]")
+            a_out = "ac"
+
+        # Added-audio tracks: each placed at its offset, plays for its own
+        # duration (padded with silence), then mixed with the clip audio.
+        if add_track_indices and needs_audio:
+            total = max(0.01, sequence_length(job.clips))
+            extra_labels: list[str] = []
+            replace_any = False
+            orig_volume = 1.0
+            for i, track_idx in enumerate(add_track_indices):
+                track = job.audio_tracks[i]
+                offset = max(0.0, track.offset)
+                natural_dur = track.duration if track.duration > 0 else total
+                end_t = min(total, offset + natural_dur)
+                play_dur = max(0.01, end_t - offset)
+                pre_ms = int(round(offset * 1000))
+                delay_stage = (
+                    f"adelay={pre_ms}:all=1," if pre_ms > 0 else ""
+                )
+                label = f"extra_a{i}"
+                parts.append(
+                    f"[{track_idx}:a]"
+                    f"atrim=duration={play_dur:.3f},asetpts=PTS-STARTPTS,"
+                    f"{delay_stage}"
+                    f"apad=whole_dur={total:.3f},"
+                    f"volume={track.volume:.3f}[{label}]"
+                )
+                extra_labels.append(label)
+                if track.replace:
+                    replace_any = True
+                orig_volume = track.original_volume
+
+            if len(extra_labels) == 1:
+                mixed_extra = extra_labels[0]
+            else:
+                joined = "".join(f"[{lbl}]" for lbl in extra_labels)
+                parts.append(
+                    f"{joined}amix=inputs={len(extra_labels)}:"
+                    f"duration=longest:dropout_transition=0[extra_mix]"
+                )
+                mixed_extra = "extra_mix"
+
+            if replace_any or a_out is None:
+                a_out = mixed_extra
+            else:
+                parts.append(
+                    f"[{a_out}]volume={orig_volume:.3f}[orig_a];"
+                    f"[orig_a][{mixed_extra}]amix=inputs=2:"
+                    f"duration=longest:dropout_transition=0[mix_a]"
+                )
+                a_out = "mix_a"
+
+        return ";".join(parts), v_out or "", a_out
+
+    # --- run ----------------------------------------------------------
+
+    def _execute(self, cmd: list[str]) -> None:
+        job = self._job
+        if job.region_start is not None and job.region_end is not None:
+            total = max(0.01, job.region_end - job.region_start)
+        else:
+            total = max(0.01, job.total_timeline)
+        self._proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            **_POPEN_KWARGS,
+        )
+        assert self._proc.stdout is not None
+        for line in self._proc.stdout:
+            if self._cancelled:
+                self._proc.terminate()
+                break
+            line = line.strip()
+            if not line:
+                continue
+            key, _, value = line.partition("=")
+            if key in ("out_time_us", "out_time_ms") and value.lstrip("-").isdigit():
+                t = int(value) / 1_000_000
+                pct = min(1.0, max(0.0, t / total))
+                self.progress.emit(int(pct * 100))
+                self._update_eta(pct * 100)
+            elif key == "progress" and value == "end":
+                self.progress.emit(100)
+                break
+        rc = self._proc.wait()
+        if rc != 0 and not self._cancelled:
+            err = self._proc.stderr.read() if self._proc.stderr else ""
+            raise RuntimeError(f"ffmpeg exited {rc}: {err.strip()[-400:]}")
+
+    def _update_eta(self, overall_pct: float) -> None:
+        if overall_pct < 2.0:
+            return
+        elapsed = time.monotonic() - self._started_wall
+        if elapsed < 0.5:
+            return
+        eta_raw = max(0.0, elapsed * (100.0 - overall_pct) / overall_pct)
+        if self._eta_smoothed is None:
+            self._eta_smoothed = eta_raw
+        else:
+            alpha = 0.35
+            self._eta_smoothed = alpha * eta_raw + (1 - alpha) * self._eta_smoothed
+        self.eta.emit(self._eta_smoothed)
+
+
+def _segments_with_gaps(clips: list[Clip], end: float) -> list[tuple[str, float, float, Clip | None]]:
+    """Return [(kind, seg_start, seg_end, clip|None)] covering [0, end)."""
+    out: list[tuple[str, float, float, Clip | None]] = []
+    cursor = 0.0
+    for c in sort_clips(clips):
+        if c.timeline_start > cursor + 1e-3:
+            out.append(("gap", cursor, c.timeline_start, None))
+        out.append(("clip", c.timeline_start, c.timeline_end, c))
+        cursor = c.timeline_end
+    if end > cursor + 1e-3:
+        out.append(("gap", cursor, end, None))
+    return out
+
+
+def _atempo_chain(speed: float) -> str:
+    s = max(0.01, speed)
+    chain: list[float] = []
+    while s < 0.5:
+        chain.append(0.5)
+        s /= 0.5
+    while s > 2.0:
+        chain.append(2.0)
+        s /= 2.0
+    chain.append(s)
+    return ",atempo=".join(f"{v:.4f}" for v in chain)
+
+
+def start_export(job: ExportJob) -> tuple[QThread, ExportWorker]:
+    thread = QThread()
+    worker = ExportWorker(job)
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    worker.finished.connect(thread.quit)
+    worker.failed.connect(thread.quit)
+    return thread, worker

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Cove Video Editor
+GenericName=Video Editor
+Comment=Trim, cut, merge, crop, caption, and export video clips
+Exec=cove-video-editor
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Video;AudioVideoEditing;Utility;
+Keywords=video;editor;trim;cut;merge;crop;subtitles;caption;ffmpeg;
+StartupNotify=true
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;
