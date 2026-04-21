@@ -85,6 +85,13 @@ artifacts via GitHub Actions.
 - **Region context menu** (right-click) — delete, crop-to-selection, or export
   only the selected region.
 
+### Updates
+
+- **Auto-update notification** on startup checks the GitHub releases API.
+  When a newer version is published, a dialog offers to install it. AppImage
+  installs get an in-place download + swap + relaunch; other packagings open
+  the release page in the user's browser.
+
 ### Export
 
 - **MP4 (H.264 + AAC), MP4 (H.265), MKV, WebM (VP9 + Opus), MOV, AVI, GIF,
