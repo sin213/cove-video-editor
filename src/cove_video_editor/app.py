@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import copy
-from pathlib import Path
-
+import os
 import time
+from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent,
@@ -17,6 +17,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
     QIcon,
@@ -30,6 +31,7 @@ from PySide6.QtGui import (
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollBar,
     QSizePolicy,
@@ -56,7 +59,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import __version__
 from . import ffmpeg_utils as ff
+from . import updater
 from .clip import (
     AddedAudio,
     Clip,
@@ -139,7 +144,7 @@ class VideoView(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Cove Video Editor")
+        self.setWindowTitle(f"Cove Video Editor v{__version__}")
         self.resize(1400, 880)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -173,6 +178,15 @@ class MainWindow(QMainWindow):
         self._update_controls_enabled()
         self._check_ffmpeg()
         self.setAcceptDrops(True)
+        # Update checker plumbing — populated on demand.
+        self._update_thread: QThread | None = None
+        self._update_worker = None
+        self._update_download_thread: QThread | None = None
+        self._update_download_worker = None
+        self._update_prompt_shown = False
+        # Kick off the first check a moment after the UI comes up so the
+        # user doesn't notice any startup hitch.
+        QTimer.singleShot(4000, self._check_for_updates_in_background)
 
     # --- shortcuts -----------------------------------------------------
 
@@ -401,10 +415,11 @@ class MainWindow(QMainWindow):
         self.split_btn.clicked.connect(self._split_at_playhead)
         self.merge_btn = QPushButton("Merge")
         self.merge_btn.setToolTip(
-            "M: merge selected clip with the next (same source).  "
-            "Shift+M: merge with the previous."
+            "Merge the selected clip with an adjacent same-source clip. "
+            "If both sides are mergeable, pick a direction from the popup. "
+            "Shortcuts: M (merge next), Shift+M (merge previous)."
         )
-        self.merge_btn.clicked.connect(self._merge_with_next_clip)
+        self.merge_btn.clicked.connect(self._on_merge_button_clicked)
         self.delete_clip_btn = QPushButton("Delete clip")
         self.delete_clip_btn.clicked.connect(self._delete_selected_clip)
         self.crop_btn = QPushButton("Crop")
@@ -718,8 +733,19 @@ class MainWindow(QMainWindow):
         self._preview_clip_id = clip.id
         self.video_view.set_native_size(clip.asset.width, clip.asset.height)
         self.crop_overlay.set_video_aspect(clip.asset.width / max(1, clip.asset.height))
+        # Pause before swapping sources — some Qt backends inherit the
+        # previous media's playback state when a new source is loaded.
+        self.player.pause()
         self.player.setSource(QUrl.fromLocalFile(str(clip.path)))
-        self.player.setPosition(int(clip.src_start * 1000))
+        # Seek to the frame under the playhead for this clip, not the clip's
+        # trim start, so the preview reflects "current selection".
+        t = self.timeline.playhead()
+        src_t = clip.src_for_timeline(t)
+        self.player.setPosition(int(max(0.0, src_t) * 1000))
+        # And pause again in case the backend kicked into PlayingState
+        # during the load. Timer is the only thing allowed to start playback.
+        if not self._play_timer.isActive():
+            self.player.pause()
         # Swap the unlinked-audio player's source so it's ready if this
         # clip is unlinked (otherwise the first tick picks it up late).
         self.clip_audio_player.pause()
@@ -930,6 +956,49 @@ class MainWindow(QMainWindow):
     def _merge_with_previous_clip(self) -> None:
         """Merge the selected clip with the previous one (Shift+M)."""
         self._do_merge(direction=-1)
+
+    def _on_merge_button_clicked(self) -> None:
+        """Merge-button entry point that lets the user pick a direction when
+        both neighbours are mergeable instead of silently picking 'next'."""
+        c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
+        if c is None:
+            self.status.showMessage("Select a clip to merge.", 3000)
+            return
+        dirs = self._available_merge_directions(c)
+        if not dirs:
+            self.status.showMessage(
+                "No adjacent clip from the same source to merge with.", 3500,
+            )
+            return
+        if len(dirs) == 1:
+            self._do_merge(direction=+1 if "next" in dirs else -1)
+            return
+        menu = QMenu(self)
+        menu.addAction("Merge with previous", self._merge_with_previous_clip)
+        menu.addAction("Merge with next", self._merge_with_next_clip)
+        pos = self.merge_btn.mapToGlobal(self.merge_btn.rect().bottomLeft())
+        menu.exec(pos)
+
+    def _available_merge_directions(self, c: Clip) -> set[str]:
+        """Return which sides (`"prev"`, `"next"`) of `c` are mergeable —
+        adjacent, same source, continuous src+timeline, same speed."""
+        ordered = sort_clips(self._clips)
+        idx = next((i for i, cc in enumerate(ordered) if cc.id == c.id), -1)
+        if idx < 0:
+            return set()
+        def compat(left: Clip, right: Clip) -> bool:
+            return (
+                left.asset.id == right.asset.id
+                and abs(left.src_end - right.src_start) < 0.05
+                and abs(left.timeline_end - right.timeline_start) < 0.05
+                and abs(left.speed - right.speed) < 1e-3
+            )
+        dirs: set[str] = set()
+        if idx + 1 < len(ordered) and compat(c, ordered[idx + 1]):
+            dirs.add("next")
+        if idx - 1 >= 0 and compat(ordered[idx - 1], c):
+            dirs.add("prev")
+        return dirs
 
     def _do_merge(self, direction: int) -> None:
         c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
@@ -1211,7 +1280,7 @@ class MainWindow(QMainWindow):
         src = QUrl.fromLocalFile(str(clip.path))
         if self.clip_audio_player.source() != src:
             self.clip_audio_player.setSource(src)
-        if self.player.playbackState() != QMediaPlayer.PlayingState and not self._play_timer.isActive():
+        if not self._play_timer.isActive():
             if self.clip_audio_player.playbackState() == QMediaPlayer.PlayingState:
                 self.clip_audio_player.pause()
             return
@@ -1265,15 +1334,27 @@ class MainWindow(QMainWindow):
                     player.pause()
 
     def _is_playing(self) -> bool:
-        return (
-            self.player.playbackState() == QMediaPlayer.PlayingState
-            or self._play_timer.isActive()
-        )
+        """Playback state is driven entirely by `_play_timer`. Qt's media
+        player state is not consulted — some backends eagerly flip into
+        PlayingState on setSource, which would otherwise falsely kick
+        aux audio players on and produce the "cursor frozen, audio playing,
+        button says Play" bug."""
+        return self._play_timer.isActive()
 
     def _on_media_status(self, status: QMediaPlayer.MediaStatus) -> None:
+        if status != QMediaPlayer.LoadedMedia:
+            return
         c = next((c for c in self._clips if c.id == self._preview_clip_id), None)
-        if c and status == QMediaPlayer.LoadedMedia:
-            self.player.setPosition(int(c.src_start * 1000))
+        if c is None:
+            return
+        # Re-seek to the playhead's frame once the media has finished
+        # loading (backends can overwrite the earlier setPosition).
+        t = self.timeline.playhead()
+        src_t = c.src_for_timeline(t)
+        self.player.setPosition(int(max(0.0, src_t) * 1000))
+        # Defensive: never let the player start playback outside the timer.
+        if not self._play_timer.isActive():
+            self.player.pause()
 
     def _on_timeline_playhead(self, t: float) -> None:
         # User-driven playhead changes pause playback — otherwise the timer
@@ -1770,6 +1851,114 @@ class MainWindow(QMainWindow):
                 f"If you are running from source, install ffmpeg with your package "
                 f"manager or drop the binaries next to the app.",
             )
+
+    # --- auto updater ---------------------------------------------------
+
+    def _check_for_updates_in_background(self) -> None:
+        """Fire-and-forget GitHub releases poll. Silent on success/failure
+        unless a newer version shows up — then `_on_update_available` fires."""
+        if self._update_thread is not None:
+            return
+        thread, worker = updater.start_check(__version__)
+        worker.updateAvailable.connect(self._on_update_available, Qt.QueuedConnection)
+        thread.finished.connect(self._on_update_check_done, Qt.QueuedConnection)
+        self._update_thread = thread
+        self._update_worker = worker
+        thread.start()
+
+    def _on_update_check_done(self) -> None:
+        self._update_thread = None
+        self._update_worker = None
+
+    def _on_update_available(self, info) -> None:
+        if self._update_prompt_shown:
+            return
+        self._update_prompt_shown = True
+        self._prompt_update(info)
+
+    def _prompt_update(self, info) -> None:
+        kind = updater.bundle_kind()
+        can_auto_install = kind == "appimage" and bool(info.asset_url)
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Cove Video Editor — update available")
+        msg.setText(
+            f"Cove Video Editor v{info.latest_version} is available.\n"
+            f"You're running v{__version__}.",
+        )
+        if can_auto_install:
+            msg.setInformativeText(
+                f"{info.asset_name} ({info.asset_size // (1024 * 1024)} MB). "
+                "The app will restart after the update.",
+            )
+            install_btn = msg.addButton("Update now", QMessageBox.AcceptRole)
+            open_btn = msg.addButton("View release", QMessageBox.HelpRole)
+            msg.addButton("Later", QMessageBox.RejectRole)
+        else:
+            msg.setInformativeText(
+                "Open the release page to download the latest installer.",
+            )
+            install_btn = None
+            open_btn = msg.addButton("View release", QMessageBox.AcceptRole)
+            msg.addButton("Later", QMessageBox.RejectRole)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if install_btn is not None and clicked is install_btn:
+            self._install_update(info)
+        elif open_btn is not None and clicked is open_btn:
+            QDesktopServices.openUrl(QUrl(info.release_url))
+
+    def _install_update(self, info) -> None:
+        if not info.asset_url:
+            QDesktopServices.openUrl(QUrl(info.release_url))
+            return
+        cache = Path(os.path.expanduser("~/.cache/cove-video-editor"))
+        cache.mkdir(parents=True, exist_ok=True)
+        dest = cache / info.asset_name
+
+        self._update_progress = QProgressDialog(
+            f"Downloading {info.asset_name}…", "Cancel", 0, 100, self,
+        )
+        self._update_progress.setWindowTitle("Updating Cove Video Editor")
+        self._update_progress.setAutoClose(False)
+        self._update_progress.setAutoReset(False)
+        self._update_progress.setMinimumDuration(0)
+        self._update_progress.setValue(0)
+
+        thread, worker = updater.start_download(info.asset_url, dest)
+        self._update_progress.canceled.connect(worker.cancel)
+        worker.progress.connect(self._update_progress.setValue, Qt.QueuedConnection)
+        worker.finished.connect(self._on_update_downloaded, Qt.QueuedConnection)
+        worker.failed.connect(self._on_update_download_failed, Qt.QueuedConnection)
+        thread.finished.connect(self._on_update_download_thread_done, Qt.QueuedConnection)
+        self._update_download_thread = thread
+        self._update_download_worker = worker
+        thread.start()
+
+    def _on_update_downloaded(self, path: str) -> None:
+        self._update_progress.close()
+        try:
+            new_path = updater.swap_in_appimage(Path(path))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "Update failed",
+                f"Couldn't swap in the new AppImage:\n{exc}",
+            )
+            return
+        updater.relaunch(new_path)
+        QApplication.instance().quit()
+
+    def _on_update_download_failed(self, msg: str) -> None:
+        self._update_progress.close()
+        QMessageBox.warning(
+            self, "Update failed",
+            f"The download didn't complete:\n{msg}",
+        )
+
+    def _on_update_download_thread_done(self) -> None:
+        self._update_download_thread = None
+        self._update_download_worker = None
 
 
 def _fmt(seconds: float) -> str:
