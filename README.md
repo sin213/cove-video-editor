@@ -124,12 +124,17 @@ installs needed.
 | Action                              | Shortcut                                |
 | ----------------------------------- | --------------------------------------- |
 | Play / pause                        | `Space`                                 |
+| Next / previous frame               | `.` / `,`                               |
 | Split at playhead                   | `S`                                     |
+| Merge selected clip with next       | `M`                                     |
+| Jump to selected clip start / end   | `[` / `]`                               |
+| Previous / next clip edge           | `Alt+,` / `Alt+.`                       |
+| Jump to sequence start / end        | `Home` / `End`                          |
 | Delete selected region / audio / clip | `Delete` / `Backspace`                |
-| Undo                                | `Ctrl+Z`                                |
+| Undo / Redo                         | `Ctrl+Z` / `Ctrl+Y`                     |
+| Exit crop mode                      | `Esc`                                   |
 | Region-select                       | Shift-drag, or drag in empty timeline   |
 | Seek                                | Click anywhere on the ruler, or drag    |
-| Move playhead while dragging clip   | Snaps to playhead, clip edges, and 0    |
 | Zoom in / out                       | Mouse wheel                             |
 | Pan horizontally                    | Shift + wheel                           |
 | Resize video vs. audio track heights | Drag the divider between them          |
