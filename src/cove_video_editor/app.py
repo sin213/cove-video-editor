@@ -199,8 +199,9 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence(Qt.Key_BracketRight), self).activated.connect(self._jump_selected_clip_end)
         QShortcut(QKeySequence("Alt+,"), self).activated.connect(self._jump_prev_clip_edge)
         QShortcut(QKeySequence("Alt+."), self).activated.connect(self._jump_next_clip_edge)
-        # Merge adjacent clips.
+        # Merge adjacent clips (M = merge right, Shift+M = merge left).
         QShortcut(QKeySequence(Qt.Key_M), self).activated.connect(self._merge_with_next_clip)
+        QShortcut(QKeySequence("Shift+M"), self).activated.connect(self._merge_with_previous_clip)
         # Esc cancels crop mode.
         esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
         esc.activated.connect(self._on_escape_pressed)
@@ -399,7 +400,10 @@ class MainWindow(QMainWindow):
         self.split_btn.setToolTip("Split the clip under the playhead (S)")
         self.split_btn.clicked.connect(self._split_at_playhead)
         self.merge_btn = QPushButton("Merge")
-        self.merge_btn.setToolTip("Merge the selected clip with the next one if they came from the same source (M)")
+        self.merge_btn.setToolTip(
+            "M: merge selected clip with the next (same source).  "
+            "Shift+M: merge with the previous."
+        )
         self.merge_btn.clicked.connect(self._merge_with_next_clip)
         self.delete_clip_btn = QPushButton("Delete clip")
         self.delete_clip_btn.clicked.connect(self._delete_selected_clip)
@@ -918,34 +922,46 @@ class MainWindow(QMainWindow):
         self._drive_main_player_from_playhead()
 
     def _merge_with_next_clip(self) -> None:
-        """Inverse of split — merge the selected clip with the next one when
-        they came from the same asset with continuous source/timeline
-        endpoints (i.e. a previous split)."""
+        """Inverse of split — merge the selected clip with the next one
+        when they came from the same asset with continuous source/timeline
+        endpoints."""
+        self._do_merge(direction=+1)
+
+    def _merge_with_previous_clip(self) -> None:
+        """Merge the selected clip with the previous one (Shift+M)."""
+        self._do_merge(direction=-1)
+
+    def _do_merge(self, direction: int) -> None:
         c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
         if c is None:
             self.status.showMessage("Select a clip to merge.", 3000)
             return
         ordered = sort_clips(self._clips)
         idx = next((i for i, cc in enumerate(ordered) if cc.id == c.id), -1)
-        if idx < 0 or idx + 1 >= len(ordered):
-            self.status.showMessage("No clip to merge into on the right.", 3000)
+        if idx < 0:
             return
-        nxt = ordered[idx + 1]
+        other_idx = idx + direction
+        if other_idx < 0 or other_idx >= len(ordered):
+            side = "right" if direction > 0 else "left"
+            self.status.showMessage(f"No clip to merge with on the {side}.", 3000)
+            return
+        other = ordered[other_idx]
+        left, right = (other, c) if direction < 0 else (c, other)
         if (
-            nxt.asset.id != c.asset.id
-            or abs(c.src_end - nxt.src_start) > 0.05
-            or abs(c.timeline_end - nxt.timeline_start) > 0.05
-            or abs(c.speed - nxt.speed) > 1e-3
+            left.asset.id != right.asset.id
+            or abs(left.src_end - right.src_start) > 0.05
+            or abs(left.timeline_end - right.timeline_start) > 0.05
+            or abs(left.speed - right.speed) > 1e-3
         ):
             self.status.showMessage(
                 "Can only merge adjacent clips from the same source.", 3500,
             )
             return
         self._snapshot()
-        c.src_end = nxt.src_end
-        self._clips = [cc for cc in self._clips if cc.id != nxt.id]
+        left.src_end = right.src_end
+        self._clips = [cc for cc in self._clips if cc.id != right.id]
         self.timeline.set_clips(self._clips)
-        self.timeline.select_clip(c.id)
+        self.timeline.select_clip(left.id)
         self._drive_main_player_from_playhead()
         self._update_range_label()
         self.status.showMessage("Clips merged.", 2500)
@@ -1095,10 +1111,9 @@ class MainWindow(QMainWindow):
         self._sync_added_audio_playback()
 
     def _drive_main_player_from_playhead(self) -> None:
-        """Make the main player mirror where the playhead is on the timeline:
-        if it's inside a clip, show that clip's frame; if it's in a gap or
-        past every clip, hide the video so the preview goes black while the
-        timer keeps advancing so any trailing added audio can play."""
+        """Make the main player mirror where the playhead is on the timeline.
+        When the play timer is idle this just seeks so the preview shows the
+        right frame; it never auto-plays."""
         t = self.timeline.playhead()
         clip = clip_at_timeline(self._clips, t) if self._clips else None
         if clip is None:
@@ -1110,14 +1125,22 @@ class MainWindow(QMainWindow):
             self._set_preview_clip(clip)
         self.video_view.set_video_visible(True)
         src_t = clip.src_for_timeline(t)
-        # Don't try to re-seek/play a clip whose trim has already elapsed —
-        # that's what produced the "loops the end" behaviour when added
-        # audio still had content past the last clip. Let it stay paused.
-        if src_t >= clip.src_end - 0.03:
+        target_ms = int(max(0.0, src_t) * 1000)
+        playing = self._play_timer.isActive()
+        # Past the trim end? Keep it paused either way.
+        past_end = src_t >= clip.src_end - 0.03
+        if not playing:
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.player.pause()
+            # Still seek so the frame preview updates after loading /
+            # splitting / undoing — just don't start playback.
+            if abs(self.player.position() - target_ms) > self._SYNC_DRIFT_MS:
+                self.player.setPosition(target_ms)
+            return
+        if past_end:
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.player.pause()
             return
-        target_ms = int(src_t * 1000)
         if self.player.playbackState() != QMediaPlayer.PlayingState:
             self.player.setPosition(target_ms)
             self.player.play()
@@ -1253,6 +1276,15 @@ class MainWindow(QMainWindow):
             self.player.setPosition(int(c.src_start * 1000))
 
     def _on_timeline_playhead(self, t: float) -> None:
+        # User-driven playhead changes pause playback — otherwise the timer
+        # races the scrub and the preview ends up lagging whatever the user
+        # just clicked on.
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+            self.player.pause()
+            self._pause_all_added_players()
+            self.clip_audio_player.pause()
+            self.play_btn.setText("Play")
         c = clip_at_timeline(self._clips, t)
         if c is None:
             # Playhead moved into a gap or past the last clip — hide the
@@ -1505,24 +1537,36 @@ class MainWindow(QMainWindow):
             c.audio_removed = False
             c.linked_audio = True
             c.audio_offset = 0.0
+            self._hard_reset_clip_audio_player()
             self.timeline.set_clips(self._clips)
             self._update_audio_volumes()
             self._sync_clip_audio_playback()
             self.status.showMessage("Audio restored.", 3000)
             return
         c.linked_audio = not c.linked_audio
+        if c.linked_audio:
+            # Relinking: drop the separate audio player cold so it doesn't
+            # keep pumping at the previous offset while the main player also
+            # plays the embedded track (the "faulty restore" doubling bug).
+            c.audio_offset = 0.0
+            self._hard_reset_clip_audio_player()
         self.timeline.set_clips(self._clips)
         self._update_audio_volumes()
         self._sync_clip_audio_playback()
         if c.linked_audio:
-            c.audio_offset = 0.0
-            self.timeline.set_clips(self._clips)
             self.status.showMessage("Audio re-linked to clip.", 3500)
         else:
             self.status.showMessage(
                 "Audio unlinked — drag along the audio track, or press Delete to remove.",
                 5000,
             )
+
+    def _hard_reset_clip_audio_player(self) -> None:
+        """Fully stop the unlinked-clip audio player so a following relink
+        doesn't leave its old playback state warm."""
+        self.clip_audio_player.stop()
+        self.clip_audio_player.setPosition(0)
+        self.clip_audio_output.setVolume(0.0)
 
     def _on_added_audio_replace_toggled(self, replace: bool) -> None:
         if self.audio_replace_cb.isChecked() != replace:
