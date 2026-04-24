@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,7 +11,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal
 
 from . import ffmpeg_utils as ff
-from .clip import Clip, sequence_length, sort_clips
+from .clip import Clip, SubtitleTrack, sequence_length, sort_clips
 
 
 if os.name == "nt":
@@ -46,6 +48,10 @@ class ExportJob:
     # of the timeline is exported (via output-side -ss / -t on the final map).
     region_start: float | None = None
     region_end: float | None = None
+    # Optional burn-in subtitle track. When present, the active
+    # SubtitleTrack is applied to the concat'd video output via the
+    # `subtitles=` filter before final mapping.
+    subtitles: SubtitleTrack | None = None
 
     @property
     def total_timeline(self) -> float:
@@ -66,6 +72,7 @@ class ExportWorker(QObject):
         self._proc: subprocess.Popen | None = None
         self._started_wall: float = 0.0
         self._eta_smoothed: float | None = None
+        self._tmp_dir: Path | None = None
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -77,18 +84,46 @@ class ExportWorker(QObject):
         try:
             cmd = self._build_command()
         except Exception as exc:  # noqa: BLE001
+            self._cleanup_tmp()
             self.failed.emit(str(exc))
             return
         self.log.emit("$ " + " ".join(cmd))
         try:
             self._execute(cmd)
         except Exception as exc:  # noqa: BLE001
+            self._cleanup_tmp()
             self.failed.emit(str(exc))
             return
+        self._cleanup_tmp()
         if self._cancelled:
             self.failed.emit("Cancelled")
             return
         self.finished.emit(self._job.output)
+
+    def _cleanup_tmp(self) -> None:
+        if self._tmp_dir is not None and self._tmp_dir.exists():
+            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
+
+    def _resolve_subtitle_path(self, sub: SubtitleTrack, tgt_w: int, tgt_h: int) -> Path:
+        """Return the path ffmpeg's ``subtitles=`` filter should load.
+
+        We always materialize a temp ASS file with ``PlayResX/PlayResY``
+        matching the output resolution. That anchors libass's coordinate
+        system to the output video so ``Fontsize=N`` renders N pixels
+        tall — 1:1 with Cove's preview overlay. The previous path loaded
+        the raw SRT; libass then converted it to ASS using its default
+        PlayResY=288, which scaled any font up by ``out_h / 288`` and
+        produced burn-ins 2–3× larger than the preview.
+
+        Cues are written with the user's sync offset already applied so
+        the live preview, sync dialog, and burn-in all stay in lockstep.
+        """
+        if self._tmp_dir is None:
+            self._tmp_dir = Path(tempfile.mkdtemp(prefix="cove-subs-"))
+        out = self._tmp_dir / f"{sub.id}.ass"
+        out.write_text(_render_ass(sub, tgt_w, tgt_h), encoding="utf-8")
+        return out
 
     # --- build --------------------------------------------------------
 
@@ -127,11 +162,22 @@ class ExportWorker(QObject):
         cmd: list[str] = [ff.require_ffmpeg(), "-y", "-hide_banner",
                           "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
-        # one -i per real clip; gaps are synthesized inside filter_complex
+        # one -i per real clip; gaps are synthesized inside filter_complex.
+        # Image clips need `-loop 1 -framerate 30 -t dur` before `-i` so
+        # ffmpeg produces a finite video stream of the right length.
         clip_inputs: dict[str, int] = {}
         for c in clips:
             clip_inputs[c.id] = len(clip_inputs)
-            cmd += ["-i", str(c.path)]
+            if c.asset.kind == "image":
+                img_dur = max(0.1, c.src_end - c.src_start) / max(0.01, c.speed)
+                cmd += [
+                    "-loop", "1",
+                    "-framerate", "30",
+                    "-t", f"{img_dur:.3f}",
+                    "-i", str(c.path),
+                ]
+            else:
+                cmd += ["-i", str(c.path)]
 
         # One -i per added-audio track. Parallel list of ffmpeg input indices
         # so the filter graph can reference them.
@@ -194,23 +240,43 @@ class ExportWorker(QObject):
                 c = clip
                 assert c is not None
                 inp = clip_inputs[c.id]
+                is_image = c.asset.kind == "image"
                 if not is_audio_only:
-                    vchain = [f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}", "setpts=PTS-STARTPTS"]
-                    if job.crop:
-                        x, y, w, h = job.crop
-                        vchain.append(f"crop={w}:{h}:{x}:{y}")
-                    vchain.append(
-                        f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
-                        f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
-                    )
-                    if abs(c.speed - 1.0) > 1e-6:
-                        vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
+                    if is_image:
+                        # Image input is already the right length (`-t`),
+                        # so trim/setpts is unnecessary — just normalize
+                        # pts to 0 and run through crop/scale/pad.
+                        vchain = ["setpts=PTS-STARTPTS"]
+                        if job.crop:
+                            x, y, w, h = job.crop
+                            vchain.append(f"crop={w}:{h}:{x}:{y}")
+                        vchain.append(
+                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                        )
+                        # yuv420p normalizes the pixel format so concat with
+                        # neighbouring video clips doesn't fail when the
+                        # source image is RGBA/RGB24.
+                        vchain.append("format=yuv420p")
+                    else:
+                        vchain = [f"trim=start={c.src_start:.3f}:end={c.src_end:.3f}",
+                                  "setpts=PTS-STARTPTS"]
+                        if job.crop:
+                            x, y, w, h = job.crop
+                            vchain.append(f"crop={w}:{h}:{x}:{y}")
+                        vchain.append(
+                            f"scale={tgt_w}:{tgt_h}:force_original_aspect_ratio=decrease,"
+                            f"pad={tgt_w}:{tgt_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+                        )
+                        if abs(c.speed - 1.0) > 1e-6:
+                            vchain.append(f"setpts={1.0/c.speed:.5f}*PTS")
                     parts.append(f"[{inp}:v]" + ",".join(vchain) + f"[v{i}]")
                     v_labels.append(f"v{i}")
                 if needs_audio:
+                    # Image clips never contribute audio.
                     if (
-                        c.asset.has_audio and not c.muted and c.linked_audio
-                        and not c.audio_removed
+                        not is_image and c.asset.has_audio and not c.muted
+                        and c.linked_audio and not c.audio_removed
                     ):
                         achain = [f"atrim=start={c.src_start:.3f}:end={c.src_end:.3f}",
                                   "asetpts=PTS-STARTPTS"]
@@ -308,6 +374,22 @@ class ExportWorker(QObject):
                 )
                 a_out = "mix_a"
 
+        # Burn-in subtitles last so they appear on the final frame
+        # regardless of what the video went through. We build a fresh ASS
+        # file with PlayResX/PlayResY matching the output, which means
+        # every Fontsize / Outline / MarginV value we bake in is in
+        # output pixels — the same sizing Cove's preview overlay uses.
+        # No `force_style` needed since the ASS already carries the
+        # resolved style block.
+        if job.subtitles is not None and not is_audio_only and v_out:
+            sub_source = self._resolve_subtitle_path(job.subtitles, tgt_w, tgt_h)
+            sub_path = ff.escape_filter_arg(str(sub_source))
+            parts.append(
+                f"[{v_out}]subtitles='{sub_path}':"
+                f"original_size={tgt_w}x{tgt_h}[v_sub]"
+            )
+            v_out = "v_sub"
+
         return ";".join(parts), v_out or "", a_out
 
     # --- run ----------------------------------------------------------
@@ -375,6 +457,105 @@ def _segments_with_gaps(clips: list[Clip], end: float) -> list[tuple[str, float,
     if end > cursor + 1e-3:
         out.append(("gap", cursor, end, None))
     return out
+
+
+def _render_ass(sub: SubtitleTrack, out_w: int, out_h: int) -> str:
+    """Serialize a SubtitleTrack to a full ASS script with PlayRes matching
+    the output video. Applies the sync offset and bakes in Fontname,
+    Fontsize (output pixels), PrimaryColour, OutlineColour, Outline,
+    Alignment, and a bottom/top MarginV sized to 6% of the video height
+    — same safe margin the preview overlay uses."""
+    primary = _hex_to_libass(sub.primary_color)
+    outline_c = _hex_to_libass(sub.outline_color)
+    alignment = 8 if sub.position == "top" else 2
+    # ASS is comma-separated; strip anything that would break style parsing.
+    font_name = (sub.font_family or "Arial").replace(",", " ").replace(":", " ")
+    font_size = max(8, int(sub.font_size))
+    outline_w = max(0, int(sub.outline))
+    margin_v = max(4, int(round(out_h * 0.06)))
+
+    # ASS Style format (libass reference):
+    #   Name, Fontname, Fontsize, PrimaryColour, SecondaryColour,
+    #   OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut,
+    #   ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow,
+    #   Alignment, MarginL, MarginR, MarginV, Encoding
+    style_fmt = (
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding"
+    )
+    style_row = (
+        f"Style: Default,{font_name},{font_size},{primary},&H000000FF,"
+        f"{outline_c},&H00000000,-1,0,0,0,100,100,0,0,1,{outline_w},0,"
+        f"{alignment},20,20,{margin_v},1"
+    )
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "YCbCr Matrix: None",
+        f"PlayResX: {out_w}",
+        f"PlayResY: {out_h}",
+        "",
+        "[V4+ Styles]",
+        style_fmt,
+        style_row,
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    offset_s = sub.offset_ms / 1000.0
+    for start, end, text in sub.cues:
+        s = max(0.0, start + offset_s)
+        e = max(s + 0.01, end + offset_s)
+        # `,` separates Dialogue fields — the Text field is last so commas
+        # inside Text are fine. `{` / `}` toggle libass override codes so
+        # we escape them to stop a stray `{` in the caption from eating
+        # the rest of the line. `\N` is a hard break; SRT uses `\n`.
+        txt = (
+            text.replace("\\", "\\\\")
+                .replace("{", "\\{")
+                .replace("}", "\\}")
+                .replace("\r", "")
+                .replace("\n", "\\N")
+        )
+        lines.append(
+            f"Dialogue: 0,{_format_ass_ts(s)},{_format_ass_ts(e)},Default,,0,0,0,,{txt}"
+        )
+
+    return "\n".join(lines) + "\n"
+
+
+def _format_ass_ts(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds - (h * 3600 + m * 60)
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _format_srt_ts(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:
+        s += 1; ms = 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _hex_to_libass(hex_color: str) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        h = "FFFFFF"
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    # Alpha 00 = fully opaque in libass.
+    return f"&H00{b.upper()}{g.upper()}{r.upper()}&"
 
 
 def _atempo_chain(speed: float) -> str:

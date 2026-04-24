@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QEvent,
+    QPoint,
     QRectF,
     QSizeF,
     QStandardPaths,
@@ -17,14 +18,20 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QBrush,
+    QColor,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
+    QFont,
+    QFontDatabase,
     QIcon,
     QImage,
     QKeySequence,
     QMouseEvent,
     QPainter,
+    QPainterPath,
+    QPen,
     QPixmap,
     QShortcut,
 )
@@ -33,6 +40,7 @@ from PySide6.QtMultimediaWidgets import QGraphicsVideoItem
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -40,10 +48,15 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGraphicsItemGroup,
+    QGraphicsPathItem,
+    QGraphicsPixmapItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -52,6 +65,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollBar,
     QSizePolicy,
+    QSlider,
+    QSpinBox,
     QSplitter,
     QStatusBar,
     QToolButton,
@@ -61,14 +76,20 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from . import ffmpeg_utils as ff
+from . import theme
 from . import updater
+from .titlebar import TitleBar, FramelessResizer
 from .clip import (
+    DEFAULT_IMAGE_DURATION,
+    IMAGE_ASSET_DURATION_CAP,
     AddedAudio,
     Clip,
     MediaAsset,
+    SubtitleTrack,
     clip_at_timeline,
     delete_region,
     keep_only_region,
+    parse_sub_cues,
     sequence_length,
     sort_clips,
     split_clip,
@@ -84,10 +105,169 @@ VIDEO_FILTERS = (
     "Videos (*.mp4 *.mkv *.webm *.mov *.avi *.m4v *.mpg *.mpeg *.wmv);;All files (*)"
 )
 AUDIO_FILTERS = "Audio (*.mp3 *.m4a *.aac *.wav *.ogg *.opus *.flac);;All files (*)"
+IMAGE_FILTERS = "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp *.tiff *.tif);;All files (*)"
+SUB_FILTERS = "Subtitles (*.srt *.vtt *.ass *.ssa);;All files (*)"
 AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+SUB_EXTS = {".srt", ".vtt", ".ass", ".ssa"}
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "cove_icon.png"
+
+
+# ── Inline icon painters for transport / zoom buttons ──────────────────────
+# Avoiding an external icon file keeps the install footprint small and lets
+# icons inherit the current palette color on hover. The shapes match the
+# stroke-style icons in the reference design.
+def _paint_icon(btn: QToolButton, kind: str) -> None:
+    class _IconRenderer(QWidget):
+        def __init__(self, host: QToolButton, which: str) -> None:
+            super().__init__(host)
+            self._which = which
+            self.setFixedSize(host.size())
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.raise_()
+
+        def paintEvent(self, _ev) -> None:  # noqa: ANN001
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing, True)
+            c = btn.palette().color(btn.foregroundRole())
+            if not btn.isEnabled():
+                c = QColor(theme.TEXT_3)
+            cx, cy = self.width() / 2, self.height() / 2
+            if self._which == "play":
+                p.setPen(Qt.NoPen)
+                p.setBrush(c)
+                p.drawPolygon([
+                    QPoint(int(cx - 5), int(cy - 6)),
+                    QPoint(int(cx - 5), int(cy + 6)),
+                    QPoint(int(cx + 7), int(cy)),
+                ])
+            elif self._which == "pause":
+                p.setPen(Qt.NoPen); p.setBrush(c)
+                p.drawRect(int(cx - 5), int(cy - 6), 3, 12)
+                p.drawRect(int(cx + 2), int(cy - 6), 3, 12)
+            elif self._which == "rewind":
+                p.setPen(Qt.NoPen); p.setBrush(c)
+                p.drawRect(int(cx - 8), int(cy - 6), 2, 12)
+                p.drawPolygon([
+                    QPoint(int(cx + 5), int(cy - 6)),
+                    QPoint(int(cx + 5), int(cy + 6)),
+                    QPoint(int(cx - 5), int(cy)),
+                ])
+            elif self._which == "end":
+                p.setPen(Qt.NoPen); p.setBrush(c)
+                p.drawRect(int(cx + 6), int(cy - 6), 2, 12)
+                p.drawPolygon([
+                    QPoint(int(cx - 5), int(cy - 6)),
+                    QPoint(int(cx - 5), int(cy + 6)),
+                    QPoint(int(cx + 5), int(cy)),
+                ])
+            elif self._which == "minus":
+                pen = QPen(c, 1.8); p.setPen(pen)
+                p.drawLine(int(cx - 5), int(cy), int(cx + 5), int(cy))
+            elif self._which == "plus":
+                pen = QPen(c, 1.8); p.setPen(pen)
+                p.drawLine(int(cx - 5), int(cy), int(cx + 5), int(cy))
+                p.drawLine(int(cx), int(cy - 5), int(cx), int(cy + 5))
+            p.end()
+
+    renderer = _IconRenderer(btn, kind)
+    renderer.show()
+    btn._icon_renderer = renderer  # keep a reference + for swap on toggle
+
+
+def _make_transport_btn(kind: str, tooltip: str) -> QToolButton:
+    btn = QToolButton()
+    btn.setFixedSize(30, 28)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setToolTip(tooltip)
+    btn.setAutoRaise(True)
+    _paint_icon(btn, kind)
+    return btn
+
+
+def _make_zoom_btn(kind: str, tooltip: str) -> QToolButton:
+    btn = QToolButton()
+    btn.setFixedSize(24, 24)
+    btn.setCursor(Qt.PointingHandCursor)
+    btn.setToolTip(tooltip)
+    btn.setAutoRaise(True)
+    _paint_icon(btn, kind)
+    return btn
+
+
+def _swap_btn_icon(btn: QToolButton, kind: str) -> None:
+    """Re-render the embedded icon (used when Play ↔ Pause)."""
+    old = getattr(btn, "_icon_renderer", None)
+    if old is not None:
+        old.setParent(None)
+        old.deleteLater()
+    _paint_icon(btn, kind)
+
+
+# ── Subtitle preview: convert text into a QPainterPath of glyph outlines ──
+def _build_subtitle_path(text: str, font: QFont) -> QPainterPath:
+    """Build a multi-line, horizontally-centered glyph path. Each line is
+    laid out on its own baseline using the font's line spacing so
+    preview wrapping matches the exported burn-in."""
+    from PySide6.QtGui import QFontMetricsF
+    path = QPainterPath()
+    fm = QFontMetricsF(font)
+    line_h = fm.lineSpacing()
+    ascent = fm.ascent()
+    lines = text.split("\n")
+    # Measure widest line so we can align each within a common box.
+    widest = max((fm.horizontalAdvance(l) for l in lines), default=0.0)
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        line_w = fm.horizontalAdvance(line)
+        x = (widest - line_w) / 2.0
+        y = ascent + i * line_h
+        path.addText(x, y, font, line)
+    return path
+
+
+# ── Subtitle font helpers ─────────────────────────────────────────────────
+# Popular, broadly-recognized families plus safe Linux fallbacks. The
+# style dialog filters this list to what's actually installed so the user
+# never picks a font that renders as ".notdef" boxes.
+_SUBTITLE_FONT_CANDIDATES = [
+    "Arial",
+    "Helvetica",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Roboto",
+    "Open Sans",
+    "Noto Sans",
+    "Inter",
+    "Cantarell",
+    "Verdana",
+    "Tahoma",
+    "Trebuchet MS",
+    "Georgia",
+    "Times New Roman",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Courier New",
+    "Liberation Mono",
+    "JetBrains Mono",
+    "Impact",
+    "Comic Sans MS",
+]
+
+
+def available_subtitle_fonts() -> list[str]:
+    """Return the subset of _SUBTITLE_FONT_CANDIDATES actually installed.
+
+    Exposed at module scope so both the style dialog and export-path
+    font-fallback can share the same list — keeps preview and burn-in in
+    visual lockstep."""
+    installed = set(QFontDatabase.families())
+    picks = [name for name in _SUBTITLE_FONT_CANDIDATES if name in installed]
+    # Always guarantee at least one choice — fall back to the app default.
+    return picks or [QApplication.font().family()]
 
 
 class VideoView(QGraphicsView):
@@ -108,6 +288,28 @@ class VideoView(QGraphicsView):
         self.video_item = QGraphicsVideoItem()
         self.video_item.setSize(QSizeF(640, 360))
         self._scene.addItem(self.video_item)
+        # Pixmap item shown in place of the video item when the current clip
+        # is a still image. Starts hidden so the normal video path is
+        # unaffected until the user adds an image clip.
+        self.pixmap_item = QGraphicsPixmapItem()
+        self.pixmap_item.setVisible(False)
+        self.pixmap_item.setTransformationMode(Qt.SmoothTransformation)
+        self._scene.addItem(self.pixmap_item)
+        # Subtitle overlay — two stacked path items so the outline is
+        # drawn OUTSIDE the glyphs (not straddling them the way a single
+        # QGraphicsSimpleTextItem pen did, which gave letters a
+        # wireframe/hollow look). Lives in scene coords (native-video
+        # pixels) so on-screen size matches what libass burns in when we
+        # pass `original_size=WxH` to ffmpeg's subtitles filter.
+        self.sub_outline = QGraphicsPathItem()
+        self.sub_outline.setZValue(20)
+        self.sub_outline.setVisible(False)
+        self._scene.addItem(self.sub_outline)
+        self.sub_fill = QGraphicsPathItem()
+        self.sub_fill.setZValue(21)
+        self.sub_fill.setPen(Qt.NoPen)
+        self.sub_fill.setVisible(False)
+        self._scene.addItem(self.sub_fill)
         self._scene.setSceneRect(QRectF(0, 0, 640, 360))
 
     def video_output(self) -> QGraphicsVideoItem:
@@ -115,6 +317,78 @@ class VideoView(QGraphicsView):
 
     def set_video_visible(self, visible: bool) -> None:
         self.video_item.setVisible(bool(visible))
+        if visible:
+            self.pixmap_item.setVisible(False)
+
+    def show_image(self, pixmap: QPixmap, native_w: int, native_h: int) -> None:
+        """Swap the preview to a still image at (`native_w`, `native_h`)."""
+        self.video_item.setVisible(False)
+        scaled = pixmap.scaled(
+            native_w, native_h,
+            Qt.IgnoreAspectRatio, Qt.SmoothTransformation,
+        ) if pixmap.width() != native_w or pixmap.height() != native_h else pixmap
+        self.pixmap_item.setPixmap(scaled)
+        self.pixmap_item.setPos(0, 0)
+        self.pixmap_item.setVisible(True)
+
+    def hide_image(self) -> None:
+        self.pixmap_item.setVisible(False)
+
+    def set_subtitle_cue(self, text: str, style: dict) -> None:
+        """Render `text` in the live subtitle overlay using `style` (see
+        SubtitleStyleDialog for the dict shape). Empty `text` hides the
+        overlay. Matches the export path that ships `original_size=WxH`
+        to libass, so on-screen font size == exported pixel height."""
+        if not text:
+            self.sub_outline.setVisible(False)
+            self.sub_fill.setVisible(False)
+            return
+
+        font = QFont(style.get("font_family") or "Arial")
+        font.setPixelSize(max(8, int(style.get("font_size", 36))))
+        font.setBold(True)
+        # Match libass's default leading so multi-line preview spacing
+        # lines up with the exported burn-in.
+        font.setLetterSpacing(QFont.PercentageSpacing, 100.0)
+
+        path = _build_subtitle_path(text, font)
+
+        fill = QColor(style.get("primary_color", "#FFFFFF"))
+        outline = QColor(style.get("outline_color", "#000000"))
+        outline_width = max(0, int(style.get("outline", 2)))
+
+        self.sub_fill.setPath(path)
+        self.sub_fill.setBrush(QBrush(fill if fill.isValid() else QColor("white")))
+
+        self.sub_outline.setPath(path)
+        self.sub_outline.setBrush(QBrush(outline if outline.isValid() else QColor("black")))
+        # Draw a 2× thick stroke, filled with the outline color, behind
+        # the fill layer — the fill then covers the inner half so only
+        # the outer rim of the stroke remains visible.
+        pen = QPen(outline if outline.isValid() else QColor("black"),
+                   outline_width * 2)
+        pen.setJoinStyle(Qt.RoundJoin)
+        pen.setCapStyle(Qt.RoundCap)
+        self.sub_outline.setPen(pen if outline_width > 0 else Qt.NoPen)
+
+        # Horizontal center; vertical either top-padded or bottom-padded.
+        scene_rect = self._scene.sceneRect()
+        br = self.sub_fill.boundingRect()
+        x = scene_rect.left() + (scene_rect.width() - br.width()) / 2.0
+        # 6% of the video height is a comfortable safe-margin.
+        margin = max(12.0, scene_rect.height() * 0.06)
+        if style.get("position", "bottom") == "top":
+            y = scene_rect.top() + margin - br.top()
+        else:
+            y = scene_rect.bottom() - br.height() - margin - br.top()
+        self.sub_fill.setPos(x, y)
+        self.sub_outline.setPos(x, y)
+        self.sub_fill.setVisible(True)
+        self.sub_outline.setVisible(outline_width > 0)
+
+    def hide_subtitle(self) -> None:
+        self.sub_outline.setVisible(False)
+        self.sub_fill.setVisible(False)
 
     def set_native_size(self, width: int, height: int) -> None:
         self.video_item.setSize(QSizeF(width, height))
@@ -145,11 +419,20 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"Cove Video Editor v{__version__}")
-        self.resize(1400, 880)
+        # Frameless with our own chrome — matches the cove-nexus /
+        # cove-video-downloader window style.
+        self.setWindowFlag(Qt.FramelessWindowHint, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.resize(1440, 900)
+        self.setMinimumSize(1100, 720)
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self._resizer = FramelessResizer(self)
 
         self._assets: dict[str, MediaAsset] = {}
+        # Source QPixmap for each image asset — loaded once on import and
+        # reused for both the preview overlay and the timeline clip thumb.
+        self._image_pixmaps: dict[str, QPixmap] = {}
         self._clips: list[Clip] = []
         self._thumb_threads: dict[str, QThread] = {}
         self._thumb_workers: dict[str, object] = {}
@@ -166,6 +449,9 @@ class MainWindow(QMainWindow):
         self._added_outputs: dict[str, QAudioOutput] = {}
         self._preview_clip_id: str = ""
         self._region_export_range: tuple[float, float] | None = None
+        # Subtitle library. Zero or more loaded SRT/VTT files; at most one
+        # may be `active` and gets burned in on export.
+        self._subs: list[SubtitleTrack] = []
 
         # Undo / redo stacks — each entry is a full state snapshot. A new
         # snapshot (user action) clears the redo stack, same as Photoshop.
@@ -187,6 +473,20 @@ class MainWindow(QMainWindow):
         # Kick off the first check a moment after the UI comes up so the
         # user doesn't notice any startup hitch.
         QTimer.singleShot(4000, self._check_for_updates_in_background)
+
+    # --- frameless window helpers -------------------------------------
+
+    def _toggle_maximize(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def changeEvent(self, event) -> None:  # noqa: ANN001
+        if event.type() == QEvent.WindowStateChange:
+            if hasattr(self, "titlebar"):
+                self.titlebar.set_maximized(self.isMaximized())
+        super().changeEvent(event)
 
     # --- shortcuts -----------------------------------------------------
 
@@ -229,7 +529,10 @@ class MainWindow(QMainWindow):
         sb.setPageStep(max(1, page_px))
         sb.setSingleStep(40)
         sb.blockSignals(False)
-        sb.setVisible(max_px > 0)
+        # Always visible — disabled (grayed out) when there's nothing to
+        # scroll, so the zoom cluster stays pinned right in the row
+        # instead of stretching across an empty gap. VideoPad does the same.
+        sb.setEnabled(max_px > 0)
 
     def _on_timeline_scroll_value(self, v: int) -> None:
         sb = self.timeline_scrollbar
@@ -237,6 +540,43 @@ class MainWindow(QMainWindow):
             sb.blockSignals(True)
             sb.setValue(v)
             sb.blockSignals(False)
+
+    # --- zoom bar ------------------------------------------------------
+
+    def _pps_to_slider(self, pps: float) -> int:
+        """Map pixels-per-second (log-scale between PPS_MIN and PPS_MAX) to
+        the slider's 0..100 integer range."""
+        import math
+        lo = self.timeline.PPS_MIN
+        hi = self.timeline.PPS_MAX
+        pps = max(lo, min(hi, pps))
+        return int(round(100.0 * math.log(pps / lo) / math.log(hi / lo)))
+
+    def _slider_to_pps(self, val: int) -> float:
+        import math
+        lo = self.timeline.PPS_MIN
+        hi = self.timeline.PPS_MAX
+        return lo * (hi / lo) ** (max(0, min(100, val)) / 100.0)
+
+    def _on_zoom_slider_changed(self, val: int) -> None:
+        new_pps = self._slider_to_pps(val)
+        if abs(new_pps - self.timeline.pixels_per_second()) > 0.01:
+            self.timeline.set_pixels_per_second(new_pps)
+
+    def _sync_zoom_slider(self, pps: float) -> None:
+        """Called when the timeline reports a zoom change from wheel or
+        code. Updates the slider position without re-emitting valueChanged."""
+        target = self._pps_to_slider(pps)
+        if self.zoom_slider.value() != target:
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(target)
+            self.zoom_slider.blockSignals(False)
+
+    def _zoom_in_clicked(self) -> None:
+        self.timeline.set_pixels_per_second(self.timeline.pixels_per_second() * 1.25)
+
+    def _zoom_out_clicked(self) -> None:
+        self.timeline.set_pixels_per_second(self.timeline.pixels_per_second() / 1.25)
 
     # --- undo / redo --------------------------------------------------
 
@@ -320,25 +660,45 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("CentralRoot")
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(6, 6, 6, 6)
-        root.setSpacing(6)
+        root_vert = QVBoxLayout(central)
+        root_vert.setContentsMargins(0, 0, 0, 0)
+        root_vert.setSpacing(0)
+
+        # --- custom titlebar (frameless chrome)
+        self.titlebar = TitleBar(self, title="Cove Video Editor", version=__version__)
+        self.titlebar.minimizeRequested.connect(self.showMinimized)
+        self.titlebar.maxRestoreRequested.connect(self._toggle_maximize)
+        self.titlebar.closeRequested.connect(self.close)
+        root_vert.addWidget(self.titlebar, 0)
+
+        # --- main content container
+        body = QWidget()
+        body.setObjectName("CoveBody")
+        root_vert.addWidget(body, 1)
+        root = QVBoxLayout(body)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(10)
 
         # top splitter: bin | preview
         top_split = QSplitter(Qt.Horizontal)
         top_split.setChildrenCollapsible(False)
+        top_split.setHandleWidth(6)
 
         self.clip_bin = ClipBin()
-        self.clip_bin.addClicked.connect(self._on_bin_add_clicked)
         self.clip_bin.assetActivated.connect(self._on_asset_activated)
         self.clip_bin.assetDeleteRequested.connect(self._on_asset_delete_requested)
         self.clip_bin.filesDropped.connect(self._on_bin_files_dropped)
+        self.clip_bin.subActivated.connect(self._on_sub_activated)
+        self.clip_bin.subDeleteRequested.connect(self._on_sub_delete_requested)
+        self.clip_bin.subStyleRequested.connect(self._on_sub_style_requested)
+        self.clip_bin.subSyncRequested.connect(self._on_sub_sync_requested)
         top_split.addWidget(self.clip_bin)
 
         preview_box = QFrame()
-        preview_box.setFrameShape(QFrame.StyledPanel)
-        preview_box.setStyleSheet("QFrame { background:#0f1116; border:1px solid #2a2f3a; }")
+        preview_box.setObjectName("PreviewStage")
+        preview_box.setFrameShape(QFrame.NoFrame)
         pv_lay = QVBoxLayout(preview_box)
         pv_lay.setContentsMargins(0, 0, 0, 0)
         pv_lay.setSpacing(0)
@@ -354,9 +714,9 @@ class MainWindow(QMainWindow):
         pv_lay.addWidget(self.video_container, stretch=1)
 
         top_split.addWidget(preview_box)
-        top_split.setStretchFactor(0, 2)
-        top_split.setStretchFactor(1, 7)
-        top_split.setSizes([260, 980])
+        top_split.setStretchFactor(0, 0)
+        top_split.setStretchFactor(1, 1)
+        top_split.setSizes([300, 1120])
         root.addWidget(top_split, stretch=1)
 
         # Added-audio mode controls — no UI; we default to "mix with equal
@@ -406,10 +766,58 @@ class MainWindow(QMainWindow):
         self.clip_audio_player.setAudioOutput(self.clip_audio_output)
 
         # --- transport row
-        transport = QHBoxLayout()
-        self.play_btn = QToolButton()
-        self.play_btn.setText("Play")
+        transport_bar = QFrame()
+        transport_bar.setObjectName("TransportBar")
+        transport = QHBoxLayout(transport_bar)
+        transport.setContentsMargins(10, 8, 10, 8)
+        transport.setSpacing(8)
+
+        # Transport cluster: Rewind / Play-Pause / End. Grouped inside a
+        # bordered box to match the design's "pill" treatment.
+        transport_cluster = QFrame()
+        transport_cluster.setObjectName("TransportCluster")
+        transport_cluster.setStyleSheet(
+            "QFrame#TransportCluster { background:#0a1013;"
+            f" border:1px solid {theme.BORDER}; border-radius:8px; }}"
+        )
+        cluster_lay = QHBoxLayout(transport_cluster)
+        cluster_lay.setContentsMargins(3, 3, 3, 3)
+        cluster_lay.setSpacing(2)
+
+        self.rewind_btn = _make_transport_btn("rewind", "Go to start")
+        self.rewind_btn.clicked.connect(lambda: self.timeline.set_playhead(0.0))
+        cluster_lay.addWidget(self.rewind_btn)
+
+        self.play_btn = _make_transport_btn("play", "Play / Pause (Space)")
         self.play_btn.clicked.connect(self._toggle_play)
+        cluster_lay.addWidget(self.play_btn)
+
+        self.end_btn = _make_transport_btn("end", "Go to end")
+        self.end_btn.clicked.connect(
+            lambda: self.timeline.set_playhead(self._total_playback_length())
+        )
+        cluster_lay.addWidget(self.end_btn)
+        transport.addWidget(transport_cluster)
+
+        # Timecode box — read + write. Copy the exact time out when hand-
+        # writing SRT cues, or type a time like `1:23.456` to jump there.
+        self.timecode_edit = QLineEdit("0:00:00.000")
+        self.timecode_edit.setObjectName("Timecode")
+        self.timecode_edit.setFixedWidth(116)
+        self.timecode_edit.setAlignment(Qt.AlignCenter)
+        self.timecode_edit.setToolTip(
+            "Current playhead. Accepts `SS.mmm`, `MM:SS.mmm`, or `H:MM:SS.mmm`."
+        )
+        self.timecode_edit.editingFinished.connect(self._on_timecode_edited)
+        transport.addWidget(self.timecode_edit)
+
+        # Thin divider
+        divider = QFrame()
+        divider.setFixedWidth(1)
+        divider.setFixedHeight(22)
+        divider.setStyleSheet(f"background:{theme.BORDER};")
+        transport.addWidget(divider)
+
         self.split_btn = QPushButton("Split")
         self.split_btn.setToolTip("Split the clip under the playhead (S)")
         self.split_btn.clicked.connect(self._split_at_playhead)
@@ -429,19 +837,17 @@ class MainWindow(QMainWindow):
         self.crop_reset_btn.setVisible(False)
         self.crop_reset_btn.clicked.connect(self._on_crop_reset)
         self.range_label = QLabel("—")
-        self.range_label.setStyleSheet("color:#cfd0d4;")
+        self.range_label.setObjectName("RangeLabel")
 
-        transport.addWidget(self.play_btn)
-        transport.addSpacing(8)
         transport.addWidget(self.split_btn)
         transport.addWidget(self.merge_btn)
         transport.addWidget(self.delete_clip_btn)
-        transport.addSpacing(8)
+        transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_reset_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
-        root.addLayout(transport)
+        root.addWidget(transport_bar)
 
         # --- timeline
         self.timeline = TimelineWidget()
@@ -470,35 +876,57 @@ class MainWindow(QMainWindow):
         self.timeline.scrollValueChanged.connect(self._on_timeline_scroll_value)
         root.addWidget(self.timeline, stretch=0)
 
+        # Scrollbar + VideoPad-style zoom bar share one row. Scrollbar
+        # stretches; the zoom cluster sits on the right with a fixed width.
+        sb_bar = QFrame()
+        sb_bar.setObjectName("ZoomBar")
+        sb_row = QHBoxLayout(sb_bar)
+        sb_row.setContentsMargins(12, 7, 12, 7)
+        sb_row.setSpacing(8)
         self.timeline_scrollbar = QScrollBar(Qt.Horizontal)
         self.timeline_scrollbar.setRange(0, 0)
+        self.timeline_scrollbar.setMinimumWidth(120)
         self.timeline_scrollbar.valueChanged.connect(self.timeline.set_scroll_x)
-        root.addWidget(self.timeline_scrollbar)
+        sb_row.addWidget(self.timeline_scrollbar, stretch=1)
+
+        self.zoom_out_btn = _make_zoom_btn("minus", "Zoom out (Shift+Scroll also scrolls)")
+        self.zoom_out_btn.clicked.connect(self._zoom_out_clicked)
+        sb_row.addWidget(self.zoom_out_btn)
+
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(0, 100)
+        self.zoom_slider.setFixedWidth(160)
+        self.zoom_slider.setToolTip(
+            "Zoom the timeline. Mouse wheel over the timeline does the same."
+        )
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        sb_row.addWidget(self.zoom_slider)
+
+        self.zoom_in_btn = _make_zoom_btn("plus", "Zoom in")
+        self.zoom_in_btn.clicked.connect(self._zoom_in_clicked)
+        sb_row.addWidget(self.zoom_in_btn)
+
+        root.addWidget(sb_bar)
+
+        # Sync slider when the user wheel-zooms on the timeline.
+        self.timeline.pixelsPerSecondChanged.connect(self._sync_zoom_slider)
+        self._sync_zoom_slider(self.timeline.pixels_per_second())
 
         # --- export row
-        bottom = QHBoxLayout()
+        export_bar = QFrame()
+        export_bar.setObjectName("ExportBar")
+        bottom = QHBoxLayout(export_bar)
+        bottom.setContentsMargins(14, 10, 14, 10)
         bottom.setSpacing(12)
         self.format_combo = QComboBox()
         for key in ff.EXPORT_FORMATS:
             self.format_combo.addItem(key)
         self.format_combo.setCurrentText("MP4 (H.264 + AAC)")
-        bottom.addWidget(QLabel("Export as"))
-        bottom.addWidget(self.format_combo, stretch=1)
-
-        self.export_btn = QPushButton("Export")
-        self.export_btn.setMinimumHeight(34)
-        self.export_btn.setStyleSheet(
-            "QPushButton { background:#2563eb; color:white; font-weight:600;"
-            " border:none; border-radius:6px; padding:6px 20px; }"
-            "QPushButton:hover { background:#1d4ed8; }"
-            "QPushButton:disabled { background:#3a4150; color:#9aa0ad; }"
-        )
-        self.export_btn.clicked.connect(self._on_export_clicked)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setEnabled(False)
-        self.cancel_btn.clicked.connect(self._on_cancel_clicked)
-        bottom.addWidget(self.export_btn)
-        bottom.addWidget(self.cancel_btn)
+        self.format_combo.setMinimumWidth(220)
+        export_lbl = QLabel("EXPORT AS")
+        export_lbl.setObjectName("ExportLabel")
+        bottom.addWidget(export_lbl)
+        bottom.addWidget(self.format_combo, stretch=0)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -507,13 +935,24 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("%p%")
         self._last_progress = 0
         self._last_eta: float | None = None
-        bottom.addWidget(self.progress, stretch=2)
+        bottom.addWidget(self.progress, stretch=1)
 
-        root.addLayout(bottom)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self._on_cancel_clicked)
+        bottom.addWidget(self.cancel_btn)
+
+        self.export_btn = QPushButton("Export")
+        self.export_btn.setObjectName("PrimaryButton")
+        self.export_btn.setMinimumHeight(34)
+        self.export_btn.clicked.connect(self._on_export_clicked)
+        bottom.addWidget(self.export_btn)
+
+        root.addWidget(export_bar)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage("Drop videos into the Media panel, or click + Video.", 10000)
+        self.status.showMessage("Drop videos, audio, images, or subtitles into the Media panel.", 10000)
 
     # --- drag & drop into the whole window ---------------------------
 
@@ -533,15 +972,17 @@ class MainWindow(QMainWindow):
             if asset and asset.kind == "audio":
                 self._set_added_audio(asset.path)
             elif asset:
+                # Video + image both land on the video track.
                 self._append_clip_for_asset(asset_id)
             event.acceptProposedAction()
             return
         if md.hasUrls():
             paths = [Path(u.toLocalFile()) for u in md.urls() if u.toLocalFile()]
             audio_paths = [p for p in paths if p.suffix.lower() in AUDIO_EXTS]
-            video_paths = [p for p in paths if p.suffix.lower() not in AUDIO_EXTS]
-            if video_paths:
-                self._import_paths(video_paths)
+            other_paths = [p for p in paths if p.suffix.lower() not in AUDIO_EXTS]
+            if other_paths:
+                # _import_paths handles video, image, and subtitle files.
+                self._import_paths(other_paths)
             for p in audio_paths:
                 self._append_added_audio(p)
             event.acceptProposedAction()
@@ -557,21 +998,16 @@ class MainWindow(QMainWindow):
 
     # --- importing ----------------------------------------------------
 
-    def _on_bin_add_clicked(self, kind: str) -> None:
-        if kind == "audio":
-            paths, _ = QFileDialog.getOpenFileNames(self, "Add audio", "", AUDIO_FILTERS)
-        else:
-            videos_dir = QStandardPaths.writableLocation(QStandardPaths.MoviesLocation)
-            paths, _ = QFileDialog.getOpenFileNames(self, "Add videos", videos_dir, VIDEO_FILTERS)
-        if paths:
-            self._import_paths([Path(p) for p in paths])
-
     def _import_paths(self, paths: list[Path], append_to_timeline: bool = True) -> None:
         new_assets: list[MediaAsset] = []
         for p in paths:
             if not p.exists():
                 continue
-            if p.suffix.lower() in AUDIO_EXTS:
+            ext = p.suffix.lower()
+            if ext in SUB_EXTS:
+                self._import_sub(p)
+                continue
+            if ext in AUDIO_EXTS:
                 try:
                     dur = ff.probe_audio_duration(p)
                 except Exception as exc:  # noqa: BLE001
@@ -581,6 +1017,10 @@ class MainWindow(QMainWindow):
                     path=p, duration=dur, width=0, height=0, fps=0.0,
                     has_audio=True, kind="audio",
                 )
+            elif ext in IMAGE_EXTS:
+                asset = self._build_image_asset(p)
+                if asset is None:
+                    continue
             else:
                 try:
                     info = ff.probe(p)
@@ -603,6 +1043,48 @@ class MainWindow(QMainWindow):
 
         self._update_controls_enabled()
 
+    def _build_image_asset(self, p: Path) -> MediaAsset | None:
+        """Load `p` as a QImage and wrap it as an image MediaAsset. Returns
+        None on failure (unsupported format or decode error).
+
+        The asset's ``duration`` is the permissive upper cap so the
+        properties dialog allows stretching the still card. Each Clip built
+        from it defaults to DEFAULT_IMAGE_DURATION seconds on the timeline.
+        """
+        img = QImage(str(p))
+        if img.isNull():
+            QMessageBox.warning(
+                self, f"Could not open {p.name}",
+                "This image format isn't readable.",
+            )
+            return None
+        asset = MediaAsset(
+            path=p, duration=IMAGE_ASSET_DURATION_CAP,
+            width=img.width(), height=img.height(),
+            fps=0.0, has_audio=False, kind="image", thumb=img,
+        )
+        self._image_pixmaps[asset.id] = QPixmap.fromImage(img)
+        return asset
+
+    def _import_sub(self, p: Path) -> None:
+        """Stash an SRT / VTT in the Subs list. The first imported subtitle
+        is auto-activated so the user doesn't have to click twice to try
+        burn-in on export."""
+        existing = next((s for s in self._subs if s.path == p), None)
+        if existing is not None:
+            self._activate_sub(existing.id)
+            self.status.showMessage(f"Subtitle already imported: {p.name}", 3000)
+            return
+        cues = parse_sub_cues(p)
+        sub = SubtitleTrack(path=p, active=not self._subs, cues=cues)
+        self._subs.append(sub)
+        self.clip_bin.add_sub(sub.id, p.name, str(p), active=sub.active)
+        if sub.active:
+            self.clip_bin.set_active_sub(sub.id)
+            self._refresh_subtitle_overlay()
+        note = f" ({len(cues)} cues)" if cues else " (no cues parsed — live preview unavailable)"
+        self.status.showMessage(f"Subtitle imported: {p.name}{note}", 5000)
+
     def _on_asset_activated(self, asset_id: str) -> None:
         asset = self._assets.get(asset_id)
         if asset is None:
@@ -610,7 +1092,187 @@ class MainWindow(QMainWindow):
         if asset.kind == "audio":
             self._append_added_audio(asset.path)
         else:
+            # Video and image assets both land on the video track.
             self._append_clip_for_asset(asset_id)
+
+    def _activate_sub(self, sub_id: str) -> None:
+        """Mark `sub_id` as the active (burn-in) subtitle; toggle the
+        existing active one off if the user clicks it a second time."""
+        target = next((s for s in self._subs if s.id == sub_id), None)
+        if target is None:
+            return
+        already = target.active
+        for s in self._subs:
+            s.active = False
+        if not already:
+            target.active = True
+        self.clip_bin.set_active_sub(target.id if target.active else "")
+        self._refresh_subtitle_overlay()
+        if target.active:
+            self.status.showMessage(
+                f"Burn-in on export: {target.path.name}", 4000,
+            )
+        else:
+            self.status.showMessage("Subtitle burn-in disabled.", 3000)
+
+    def _on_sub_activated(self, sub_id: str) -> None:
+        self._activate_sub(sub_id)
+
+    def _on_sub_delete_requested(self, sub_id: str) -> None:
+        sub = next((s for s in self._subs if s.id == sub_id), None)
+        if sub is None:
+            return
+        self._subs = [s for s in self._subs if s.id != sub_id]
+        self.clip_bin.remove_sub(sub_id)
+        # If we killed the active one, pick a new active (first remaining).
+        if sub.active and self._subs:
+            self._subs[0].active = True
+            self.clip_bin.set_active_sub(self._subs[0].id)
+        self._refresh_subtitle_overlay()
+        self.status.showMessage(f"Subtitle removed: {sub.path.name}", 3000)
+
+    def _refresh_subtitle_overlay(self) -> None:
+        """Recompute and paint the live subtitle overlay from the active
+        track's cues at the current playhead. Safe to call any time —
+        no-op when no active sub exists."""
+        active = next((s for s in self._subs if s.active), None)
+        if active is None or not active.cues:
+            self.video_view.hide_subtitle()
+            return
+        text = active.cue_at(self.timeline.playhead())
+        if not text:
+            self.video_view.hide_subtitle()
+            return
+        style = {
+            "font_family": active.font_family,
+            "font_size": active.font_size,
+            "primary_color": active.primary_color,
+            "outline_color": active.outline_color,
+            "outline": active.outline,
+            "position": active.position,
+        }
+        self.video_view.set_subtitle_cue(text, style)
+
+    def _on_sub_style_requested(self) -> None:
+        active = next((s for s in self._subs if s.active), None)
+        if active is None:
+            QMessageBox.information(
+                self, "No active subtitle",
+                "Import a subtitle file and double-click it to mark it active "
+                "before editing its style.",
+            )
+            return
+        # Snapshot the pre-dialog style so Cancel fully reverts the live
+        # preview changes the user made while editing.
+        saved = {
+            "font_family": active.font_family,
+            "font_size": active.font_size,
+            "primary_color": active.primary_color,
+            "outline_color": active.outline_color,
+            "outline": active.outline,
+            "position": active.position,
+        }
+        dlg = SubtitleStyleDialog(active, self)
+        dlg.stylePreview.connect(self._apply_sub_style_preview)
+        # Make sure a cue is visible while the dialog is open so the user
+        # sees live changes. If no cue covers the playhead, jump to the
+        # first cue so they have something to style against.
+        if active.cues and not active.cue_at(self.timeline.playhead()):
+            self.timeline.set_playhead(active.cues[0][0] + 0.05)
+        result = dlg.exec()
+        if result == QDialog.Accepted:
+            vals = dlg.result_values() or saved
+            active.font_family = vals.get("font_family", active.font_family)
+            active.font_size = vals["font_size"]
+            active.primary_color = vals["primary_color"]
+            active.outline_color = vals["outline_color"]
+            active.outline = vals["outline"]
+            active.position = vals["position"]
+            self.status.showMessage("Subtitle style updated.", 3000)
+        else:
+            # Revert — the live preview wrote changes into `active` as the
+            # user typed; roll them back now.
+            for k, v in saved.items():
+                setattr(active, k, v)
+        self._refresh_subtitle_overlay()
+
+    def _apply_sub_style_preview(self, vals: dict) -> None:
+        """Called by SubtitleStyleDialog on every widget change. Writes
+        the in-progress style onto the active sub and repaints the
+        overlay so the user sees the result in real time."""
+        active = next((s for s in self._subs if s.active), None)
+        if active is None:
+            return
+        active.font_family = vals.get("font_family", active.font_family)
+        active.font_size = int(vals.get("font_size", active.font_size))
+        active.primary_color = vals.get("primary_color", active.primary_color)
+        active.outline_color = vals.get("outline_color", active.outline_color)
+        active.outline = int(vals.get("outline", active.outline))
+        active.position = vals.get("position", active.position)
+        self._refresh_subtitle_overlay()
+
+    # --- subtitle sync ------------------------------------------------
+
+    def _on_sub_sync_requested(self) -> None:
+        active = next((s for s in self._subs if s.active), None)
+        if active is None:
+            QMessageBox.information(
+                self, "No active subtitle",
+                "Import a subtitle file and mark it active before syncing.",
+            )
+            return
+        if not active.cues:
+            QMessageBox.information(
+                self, "No cues parsed",
+                ".ass / .ssa formats aren't parsed for in-app sync. "
+                "Pre-sync them in a subtitle editor, then re-import.",
+            )
+            return
+        # Modeless: a second click raises the existing dialog instead of
+        # stacking a new one — lets the user keep scrubbing / playing the
+        # video while dragging the offset slider and seeing the overlay
+        # shift in real time.
+        existing = getattr(self, "_sync_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        saved_offset = active.offset_ms
+        dlg = SubtitleSyncDialog(active, self)
+        dlg.offsetPreview.connect(self._apply_sub_offset_preview)
+
+        def _on_closed(result: int) -> None:
+            if result != QDialog.Accepted:
+                current = next((s for s in self._subs if s.active), None)
+                if current is not None:
+                    current.offset_ms = saved_offset
+                    self._refresh_subtitle_overlay()
+            else:
+                current = next((s for s in self._subs if s.active), None)
+                if current is not None:
+                    sign = "+" if current.offset_ms > 0 else ""
+                    self.status.showMessage(
+                        f"Subtitle sync offset: {sign}{current.offset_ms} ms",
+                        4000,
+                    )
+            self._sync_dialog = None
+
+        dlg.finished.connect(_on_closed)
+        self._sync_dialog = dlg
+        dlg.setModal(False)
+        # Qt.Tool keeps the dialog floating over the main window without
+        # pulling it out of the normal window stack order.
+        dlg.setWindowFlag(Qt.Tool, True)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _apply_sub_offset_preview(self, offset_ms: int) -> None:
+        active = next((s for s in self._subs if s.active), None)
+        if active is None:
+            return
+        active.offset_ms = int(offset_ms)
+        self._refresh_subtitle_overlay()
 
     def _on_bin_files_dropped(self, paths: list) -> None:
         # Import into the library only — don't auto-append videos to the
@@ -643,6 +1305,7 @@ class MainWindow(QMainWindow):
             self._refresh_added_audio_display()
             self._update_audio_volumes()
         self._assets.pop(asset_id, None)
+        self._image_pixmaps.pop(asset_id, None)
         self.clip_bin.remove_asset(asset_id)
         if not self._clips:
             self._halt_playback_no_clips()
@@ -655,25 +1318,37 @@ class MainWindow(QMainWindow):
         self._insert_clip_at(asset_id, sequence_length(self._clips))
 
     def _insert_clip_at(self, asset_id: str, drop_t: float) -> None:
-        """Add a video clip to the timeline at `drop_t`. If the position
-        falls inside an existing clip, advance to the end of that clip so
-        the new clip lands cleanly to its right."""
+        """Add a video or image clip to the timeline at `drop_t`. If the
+        position falls inside an existing clip, advance to the end of that
+        clip so the new one lands cleanly to its right."""
         asset = self._assets.get(asset_id)
-        if asset is None or asset.kind != "video":
+        if asset is None or asset.kind not in ("video", "image"):
             return
         self._snapshot()
         start_t = max(0.0, drop_t)
         for c in sort_clips(self._clips):
             if c.timeline_start <= start_t < c.timeline_end:
                 start_t = c.timeline_end
-        clip = Clip(asset=asset, timeline_start=start_t)
+        if asset.kind == "image":
+            # Image clips land at the compact default card length; the user
+            # can stretch them in the properties dialog (bounded by the
+            # asset's `duration` cap).
+            clip = Clip(
+                asset=asset, timeline_start=start_t,
+                src_start=0.0, src_end=DEFAULT_IMAGE_DURATION,
+            )
+        else:
+            clip = Clip(asset=asset, timeline_start=start_t)
         self._clips.append(clip)
         self._clips = sort_clips(self._clips)
         self.timeline.set_clips(self._clips)
         self.timeline.select_clip(clip.id)
-        self._kick_off_thumbs(clip)
-        if asset.has_audio:
-            self._kick_off_waveform(clip)
+        if asset.kind == "image":
+            self._seed_image_clip_thumbs(clip)
+        else:
+            self._kick_off_thumbs(clip)
+            if asset.has_audio:
+                self._kick_off_waveform(clip)
         # For the very first clip, move the playhead onto it so the preview
         # actually shows the first frame instead of staying black at t=0 in
         # an area that may or may not contain the new clip.
@@ -688,6 +1363,19 @@ class MainWindow(QMainWindow):
         self._update_range_label()
         self._update_controls_enabled()
 
+    def _seed_image_clip_thumbs(self, clip: Clip) -> None:
+        """Image clips never run a thumbnail worker — the asset is the only
+        'frame'. Seed `thumb_pixmaps` with one scaled pixmap so the timeline
+        strip renders it like a tiled backdrop."""
+        pm = self._image_pixmaps.get(clip.asset.id)
+        if pm is None:
+            img = clip.asset.thumb
+            if img is not None:
+                pm = QPixmap.fromImage(img)
+                self._image_pixmaps[clip.asset.id] = pm
+        if pm is not None:
+            clip.thumb_pixmaps = [pm]
+
     def _on_asset_dropped_on_timeline(
         self, asset_id: str, drop_t: float, lane: int = 1,
     ) -> None:
@@ -699,6 +1387,7 @@ class MainWindow(QMainWindow):
                 asset.path, initial_offset=drop_t, lane=int(lane),
             )
         else:
+            # Video + image both go to the single video track.
             self._insert_clip_at(asset_id, drop_t)
 
     def _on_video_file_dropped(self, path: str, drop_t: float) -> None:
@@ -733,6 +1422,24 @@ class MainWindow(QMainWindow):
         self._preview_clip_id = clip.id
         self.video_view.set_native_size(clip.asset.width, clip.asset.height)
         self.crop_overlay.set_video_aspect(clip.asset.width / max(1, clip.asset.height))
+        if clip.asset.kind == "image":
+            # Image clips don't drive the media player — they're a static
+            # pixmap overlay. Drop the player sources so no background
+            # audio leaks through.
+            self.player.pause()
+            self.player.setSource(QUrl())
+            self.clip_audio_player.pause()
+            self.clip_audio_player.setSource(QUrl())
+            pm = self._image_pixmaps.get(clip.asset.id)
+            if pm is None and clip.asset.thumb is not None:
+                pm = QPixmap.fromImage(clip.asset.thumb)
+                self._image_pixmaps[clip.asset.id] = pm
+            if pm is not None:
+                self.video_view.show_image(pm, clip.asset.width, clip.asset.height)
+            self._update_audio_volumes()
+            return
+        # Video path (unchanged).
+        self.video_view.hide_image()
         # Pause before swapping sources — some Qt backends inherit the
         # previous media's playback state when a new source is loaded.
         self.player.pause()
@@ -1074,7 +1781,7 @@ class MainWindow(QMainWindow):
             if self._play_timer.isActive():
                 self._play_timer.stop()
             self._pause_all_added_players()
-            self.play_btn.setText("Play")
+            _swap_btn_icon(self.play_btn, "play")
         self._update_controls_enabled()
 
     def _on_audio_offset_changed(self, _clip_id: str, _offset: float) -> None:
@@ -1138,7 +1845,7 @@ class MainWindow(QMainWindow):
             self.player.pause()
             self._pause_all_added_players()
             self.clip_audio_player.pause()
-            self.play_btn.setText("Play")
+            _swap_btn_icon(self.play_btn, "play")
             return
         # Need at least one clip OR one added-audio entry to play.
         if not self._clips and not self._added_audios:
@@ -1154,7 +1861,7 @@ class MainWindow(QMainWindow):
         self._drive_main_player_from_playhead()
         self._sync_clip_audio_playback()
         self._sync_added_audio_playback()
-        self.play_btn.setText("Pause")
+        _swap_btn_icon(self.play_btn, "pause")
 
     def _total_playback_length(self) -> float:
         clip_end = sequence_length(self._clips)
@@ -1178,6 +1885,8 @@ class MainWindow(QMainWindow):
         self._drive_main_player_from_playhead()
         self._sync_clip_audio_playback()
         self._sync_added_audio_playback()
+        self._refresh_subtitle_overlay()
+        self._update_timecode_display()
 
     def _drive_main_player_from_playhead(self) -> None:
         """Make the main player mirror where the playhead is on the timeline.
@@ -1189,9 +1898,20 @@ class MainWindow(QMainWindow):
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.player.pause()
             self.video_view.set_video_visible(False)
+            self.video_view.hide_image()
             return
         if clip.id != self._preview_clip_id:
             self._set_preview_clip(clip)
+        if clip.asset.kind == "image":
+            # Keep the image pinned on screen. The play timer continues to
+            # advance the playhead so the image clip occupies its timeline
+            # span just like a video clip would.
+            if self.player.playbackState() == QMediaPlayer.PlayingState:
+                self.player.pause()
+            pm = self._image_pixmaps.get(clip.asset.id)
+            if pm is not None:
+                self.video_view.show_image(pm, clip.asset.width, clip.asset.height)
+            return
         self.video_view.set_video_visible(True)
         src_t = clip.src_for_timeline(t)
         target_ms = int(max(0.0, src_t) * 1000)
@@ -1357,6 +2077,9 @@ class MainWindow(QMainWindow):
             self.player.pause()
 
     def _on_timeline_playhead(self, t: float) -> None:
+        # Keep the timecode display in step no matter how the playhead
+        # moved — scrub, keyboard step, Home/End, etc. all route here.
+        self._update_timecode_display()
         # User-driven playhead changes pause playback — otherwise the timer
         # races the scrub and the preview ends up lagging whatever the user
         # just clicked on.
@@ -1365,21 +2088,29 @@ class MainWindow(QMainWindow):
             self.player.pause()
             self._pause_all_added_players()
             self.clip_audio_player.pause()
-            self.play_btn.setText("Play")
+            _swap_btn_icon(self.play_btn, "play")
         c = clip_at_timeline(self._clips, t)
         if c is None:
             # Playhead moved into a gap or past the last clip — hide the
             # video item so the preview goes black instead of freezing on
             # a stale frame.
             self.video_view.set_video_visible(False)
+            self.video_view.hide_image()
             if self.player.playbackState() == QMediaPlayer.PlayingState:
                 self.player.pause()
             self._sync_added_audio_playback()
             self._sync_clip_audio_playback()
+            self._refresh_subtitle_overlay()
             return
         if c.id != self._preview_clip_id:
             self._set_preview_clip(c)
             self.timeline.select_clip(c.id)
+        if c.asset.kind == "image":
+            # Image preview is already attached in _set_preview_clip; no
+            # seek to perform on the media player. Still sync added audio.
+            self._sync_added_audio_playback()
+            self._refresh_subtitle_overlay()
+            return
         self.video_view.set_video_visible(True)
         src_t = c.src_for_timeline(t)
         target_ms = int(src_t * 1000)
@@ -1396,6 +2127,7 @@ class MainWindow(QMainWindow):
             self._pending_seek_ms = None
         self._sync_added_audio_playback()
         self._sync_clip_audio_playback()
+        self._refresh_subtitle_overlay()
 
     def _flush_pending_seek(self) -> None:
         if self._pending_seek_ms is None:
@@ -1407,6 +2139,30 @@ class MainWindow(QMainWindow):
     def _update_range_label(self) -> None:
         total = sequence_length(self._clips)
         self.range_label.setText(f"Sequence: {_fmt(total)}  •  {len(self._clips)} clip(s)")
+
+    def _update_timecode_display(self) -> None:
+        """Refresh the timecode box from the timeline's playhead. Skipped
+        when the user has focus in the edit — we don't want to overwrite
+        what they're typing."""
+        if self.timecode_edit.hasFocus():
+            return
+        text = _format_timecode(self.timeline.playhead())
+        if self.timecode_edit.text() != text:
+            self.timecode_edit.setText(text)
+
+    def _on_timecode_edited(self) -> None:
+        parsed = _parse_timecode(self.timecode_edit.text())
+        if parsed is None:
+            # Roll back to the live playhead so the box never shows garbage.
+            self.timecode_edit.setText(_format_timecode(self.timeline.playhead()))
+            self.status.showMessage(
+                "Unrecognized timecode. Try `1:23.456` or `0:01:23.456`.", 3500,
+            )
+            return
+        self.timeline.set_playhead(parsed)
+        # Normalize the display to the canonical format.
+        self.timecode_edit.setText(_format_timecode(self.timeline.playhead()))
+        self.timecode_edit.clearFocus()
 
     # --- crop ---------------------------------------------------------
 
@@ -1732,6 +2488,8 @@ class MainWindow(QMainWindow):
         if self._region_export_range is not None:
             region_start, region_end = self._region_export_range
 
+        active_sub = next((s.clone() for s in self._subs if s.active), None)
+
         job = ExportJob(
             clips=[c.clone() for c in self._clips],
             output=Path(out_path),
@@ -1740,6 +2498,7 @@ class MainWindow(QMainWindow):
             audio_tracks=audio_tracks,
             region_start=region_start,
             region_end=region_end,
+            subtitles=active_sub,
         )
 
         self._last_progress = 0
@@ -1811,14 +2570,19 @@ class MainWindow(QMainWindow):
 
     def _update_controls_enabled(self) -> None:
         loaded = bool(self._clips)
+        has_any = loaded or bool(self._added_audios)
         # Play button is enabled whenever there's anything on the timeline —
         # audio-only sequences are valid too.
-        self.play_btn.setEnabled(loaded or bool(self._added_audios))
+        self.play_btn.setEnabled(has_any)
         for w in (
             self.split_btn, self.merge_btn, self.delete_clip_btn,
             self.crop_btn, self.format_combo, self.export_btn,
         ):
             w.setEnabled(loaded)
+        # Zoom controls only make sense when there's something on the
+        # timeline to zoom into.
+        for w in (self.zoom_slider, self.zoom_out_btn, self.zoom_in_btn):
+            w.setEnabled(has_any)
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         for d in (self._thumb_workers, self._wave_workers, self._added_wave_workers):
@@ -1968,6 +2732,43 @@ def _fmt(seconds: float) -> str:
     return f"{m:02d}:{s:05.2f}"
 
 
+def _format_timecode(seconds: float) -> str:
+    """Render a playhead time as ``H:MM:SS.mmm`` — VideoPad's readout format."""
+    seconds = max(0.0, seconds)
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60
+    return f"{h}:{m:02d}:{s:06.3f}"
+
+
+def _parse_timecode(raw: str) -> float | None:
+    """Parse a user-typed timecode. Accepts any of:
+
+    * ``12.345`` — raw seconds
+    * ``MM:SS.mmm`` — minutes + seconds (e.g. ``1:23.456``)
+    * ``H:MM:SS.mmm`` — hours + minutes + seconds (e.g. ``0:01:23.456``)
+
+    Returns ``None`` when the input can't be parsed so the caller can
+    leave the playhead alone and restore the display."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    try:
+        if len(parts) == 1:
+            return max(0.0, float(parts[0]))
+        if len(parts) == 2:
+            return max(0.0, int(parts[0]) * 60 + float(parts[1]))
+        if len(parts) == 3:
+            return max(
+                0.0,
+                int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]),
+            )
+    except ValueError:
+        return None
+    return None
+
+
 class ClipPropertiesDialog(QDialog):
     """Small modal shown on double-click / right-click → Properties.
 
@@ -2047,3 +2848,246 @@ class ClipPropertiesDialog(QDialog):
 
     def result_values(self) -> dict | None:
         return self._result
+
+
+class SubtitleStyleDialog(QDialog):
+    """Edit font size, colors, outline and position for the active subtitle
+    track. Every widget change emits ``stylePreview`` so the caller can
+    update the live overlay in real time — the user sees their edits
+    before committing. Accepting returns the final dict; cancelling leaves
+    it to the caller to revert from their saved snapshot."""
+
+    stylePreview = Signal(dict)
+
+    def __init__(self, sub: SubtitleTrack, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Subtitle style — {sub.path.name}")
+        self._sub = sub
+        self._result: dict | None = None
+        self._primary_color = sub.primary_color
+        self._outline_color = sub.outline_color
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        self.font_family = QComboBox()
+        choices = available_subtitle_fonts()
+        for fam in choices:
+            self.font_family.addItem(fam)
+        current = sub.font_family if sub.font_family in choices else choices[0]
+        self.font_family.setCurrentText(current)
+        self.font_family.setToolTip(
+            "Typeface used in both the live preview and the exported "
+            "burn-in. Only fonts installed on this system are listed."
+        )
+        form.addRow("Font", self.font_family)
+
+        self.font_size = QSpinBox()
+        self.font_size.setRange(10, 120)
+        self.font_size.setValue(sub.font_size)
+        self.font_size.setSuffix(" px")
+        self.font_size.setToolTip(
+            "Font pixel height at the video's native resolution. 32–48 "
+            "works for most 1080p; go larger for 4K or smaller mobile clips. "
+            "Preview and export stay in sync — no more guess-then-re-export."
+        )
+        form.addRow("Font size", self.font_size)
+
+        self.primary_btn = QPushButton()
+        self._paint_color_button(self.primary_btn, self._primary_color)
+        self.primary_btn.clicked.connect(self._pick_primary)
+        form.addRow("Text color", self.primary_btn)
+
+        self.outline_btn = QPushButton()
+        self._paint_color_button(self.outline_btn, self._outline_color)
+        self.outline_btn.clicked.connect(self._pick_outline)
+        form.addRow("Outline color", self.outline_btn)
+
+        self.outline = QSpinBox()
+        self.outline.setRange(0, 8)
+        self.outline.setValue(sub.outline)
+        form.addRow("Outline width", self.outline)
+
+        self.position = QComboBox()
+        self.position.addItem("Bottom")
+        self.position.addItem("Top")
+        self.position.setCurrentText(sub.position.capitalize())
+        form.addRow("Position", self.position)
+
+        lay.addLayout(form)
+
+        hint = QLabel(
+            "Style updates the preview live. Scrub the timeline to a cue "
+            "to see it overlaid."
+        )
+        hint.setStyleSheet("color:#9aa0ad; font-size:11px;")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        # Live preview: re-emit whenever anything changes.
+        self.font_family.currentTextChanged.connect(self._emit_preview)
+        self.font_size.valueChanged.connect(self._emit_preview)
+        self.outline.valueChanged.connect(self._emit_preview)
+        self.position.currentTextChanged.connect(self._emit_preview)
+
+    # --- helpers ------------------------------------------------------
+
+    def _current_values(self) -> dict:
+        return {
+            "font_family": self.font_family.currentText(),
+            "font_size": self.font_size.value(),
+            "primary_color": self._primary_color,
+            "outline_color": self._outline_color,
+            "outline": self.outline.value(),
+            "position": self.position.currentText().lower(),
+        }
+
+    def _emit_preview(self, *_args) -> None:
+        self.stylePreview.emit(self._current_values())
+
+    def _pick_primary(self) -> None:
+        color = QColorDialog.getColor(
+            initial=_parse_qcolor(self._primary_color), parent=self,
+            title="Text color",
+        )
+        if color.isValid():
+            self._primary_color = color.name(QColor.HexRgb).upper()
+            self._paint_color_button(self.primary_btn, self._primary_color)
+            self._emit_preview()
+
+    def _pick_outline(self) -> None:
+        color = QColorDialog.getColor(
+            initial=_parse_qcolor(self._outline_color), parent=self,
+            title="Outline color",
+        )
+        if color.isValid():
+            self._outline_color = color.name(QColor.HexRgb).upper()
+            self._paint_color_button(self.outline_btn, self._outline_color)
+            self._emit_preview()
+
+    @staticmethod
+    def _paint_color_button(btn: QPushButton, color_hex: str) -> None:
+        btn.setText(color_hex)
+        btn.setStyleSheet(
+            f"QPushButton {{ background:{color_hex}; color:{_contrast_text(color_hex)};"
+            f" border:1px solid #39404d; border-radius:4px; padding:4px 10px; }}"
+        )
+
+    def accept(self) -> None:
+        self._result = self._current_values()
+        super().accept()
+
+    def result_values(self) -> dict | None:
+        return self._result
+
+
+class SubtitleSyncDialog(QDialog):
+    """Nudge the active subtitle's offset with a spinbox + slider. Opened
+    modeless so the main window stays playable — scrub, hit Space to
+    play, drag the slider, and watch the overlay move in real time."""
+
+    offsetPreview = Signal(int)          # offset in ms (may be negative)
+
+    def __init__(
+        self, sub: SubtitleTrack, parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Sync subtitles — {sub.path.name}")
+        self._saved = sub.offset_ms
+
+        lay = QVBoxLayout(self)
+        blurb = QLabel(
+            "Drag the slider while the video plays — the live overlay "
+            "shifts as you move. OK keeps the offset, Cancel reverts."
+        )
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color:#cfd0d4;")
+        lay.addWidget(blurb)
+
+        form = QFormLayout()
+        self.offset_spin = QDoubleSpinBox()
+        self.offset_spin.setRange(-30.0, 30.0)
+        self.offset_spin.setDecimals(2)
+        self.offset_spin.setSingleStep(0.05)
+        self.offset_spin.setSuffix(" s")
+        self.offset_spin.setValue(sub.offset_ms / 1000.0)
+        form.addRow("Offset", self.offset_spin)
+
+        self.offset_slider = QSlider(Qt.Horizontal)
+        # ±5 s range by default, 10 ms granularity → 1000 steps each side.
+        self.offset_slider.setRange(-500, 500)
+        self.offset_slider.setValue(int(round(sub.offset_ms / 10)))
+        self.offset_slider.setTickInterval(50)
+        self.offset_slider.setTickPosition(QSlider.TicksBelow)
+        form.addRow("Fine", self.offset_slider)
+
+        lay.addLayout(form)
+
+        hint = QLabel(
+            "Tip: press Space in the main window to play/pause without "
+            "closing this dialog."
+        )
+        hint.setStyleSheet("color:#9aa0ad; font-size:11px;")
+        lay.addWidget(hint)
+
+        row = QHBoxLayout()
+        self.reset_btn = QPushButton("Reset to 0")
+        self.reset_btn.clicked.connect(lambda: self.set_offset_ms(0))
+        row.addWidget(self.reset_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        self._syncing = False
+        self.offset_spin.valueChanged.connect(self._on_spin_changed)
+        self.offset_slider.valueChanged.connect(self._on_slider_changed)
+
+    def _on_spin_changed(self, val: float) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        self.offset_slider.setValue(int(round(val * 100)))
+        self._syncing = False
+        self.offsetPreview.emit(int(round(val * 1000)))
+
+    def _on_slider_changed(self, val: int) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        self.offset_spin.setValue(val / 100.0)
+        self._syncing = False
+        self.offsetPreview.emit(int(round(val * 10)))
+
+    def set_offset_ms(self, ms: int) -> None:
+        self._syncing = True
+        self.offset_spin.setValue(ms / 1000.0)
+        self.offset_slider.setValue(int(round(ms / 10)))
+        self._syncing = False
+        self.offsetPreview.emit(int(ms))
+
+    def current_offset_ms(self) -> int:
+        return int(round(self.offset_spin.value() * 1000))
+
+
+def _parse_qcolor(hexstr: str) -> QColor:
+    c = QColor(hexstr)
+    if not c.isValid():
+        return QColor("#FFFFFF")
+    return c
+
+
+def _contrast_text(hex_rgb: str) -> str:
+    """Return black or white depending on perceived brightness of `hex_rgb`."""
+    c = _parse_qcolor(hex_rgb)
+    # ITU-R BT.601 luma.
+    luma = 0.299 * c.redF() + 0.587 * c.greenF() + 0.114 * c.blueF()
+    return "#000000" if luma > 0.55 else "#FFFFFF"

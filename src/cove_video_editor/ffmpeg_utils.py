@@ -160,3 +160,5 @@ def escape_filter_arg(value: str) -> str:
              .replace("'", "\\\\'")
              .replace(",", "\\,")
     )
+
+

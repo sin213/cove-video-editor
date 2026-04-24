@@ -34,6 +34,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QMenu, QWidget
 
+from . import theme
 from .clip import AddedAudio, Clip, sequence_length, sort_clips
 from .clip_bin import ASSET_MIME
 
@@ -41,8 +42,11 @@ from .clip_bin import ASSET_MIME
 RULER_H = 24
 TRACK_GAP = 10
 VIDEO_TRACK_H = 70
-AUDIO_TRACK_H = 56
-AUDIO2_TRACK_H = 48
+# Lane 0 is Audio Track 1 — shares timing with the video track's embedded
+# audio. Lane N>=1 are extra "added-audio" lanes (sound FX, music, VO).
+# Lane count is now unbounded; these are just the seed heights.
+AUDIO_LANE_DEFAULT_H = 48
+AUDIO_LANE_0_H = 56
 VIDEO_TRACK_H_MIN = 40
 VIDEO_TRACK_H_MAX = 260
 AUDIO_TRACK_H_MIN = 36
@@ -95,13 +99,16 @@ class TimelineWidget(QWidget):
     clipAudioRemoveRequested = Signal(str)        # clip id — delete clip's audio only
     scrollRangeChanged = Signal(int, int)         # scroll_max, page (in px)
     scrollValueChanged = Signal(int)              # current scroll_x (in px)
+    pixelsPerSecondChanged = Signal(float)        # emitted when zoom level changes
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMouseTracking(True)
         self._video_h: int = VIDEO_TRACK_H
-        self._audio_h: int = AUDIO_TRACK_H
-        self._audio2_h: int = AUDIO2_TRACK_H
+        # Dynamic list of audio lane heights. Index 0 = Audio Track 1 (shares
+        # timing with clip audio); subsequent entries are extra overlay lanes.
+        # Starts with two lanes to preserve the 1.x default layout.
+        self._audio_lane_heights: list[int] = [AUDIO_LANE_0_H, AUDIO_LANE_DEFAULT_H]
         self._refresh_min_height()
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAcceptDrops(True)
@@ -119,10 +126,38 @@ class TimelineWidget(QWidget):
         self._added_audio_replace: bool = False
         self._added_audio_selected_id: str = ""
 
+    # ---- audio-lane management ----------------------------------------
+
+    def num_audio_lanes(self) -> int:
+        return len(self._audio_lane_heights)
+
+    def add_audio_lane(self) -> int:
+        """Append a new empty audio lane; return its index."""
+        self._audio_lane_heights.append(AUDIO_LANE_DEFAULT_H)
+        self._refresh_min_height()
+        self.update()
+        return len(self._audio_lane_heights) - 1
+
+    def remove_audio_lane(self, lane: int) -> bool:
+        """Drop lane `lane` if it's not lane 0 and holds no added audio."""
+        if lane <= 0 or lane >= len(self._audio_lane_heights):
+            return False
+        if any(a.lane == lane for a in self._added_audios):
+            return False
+        # Slide everything above down one slot so lane indices stay packed.
+        self._audio_lane_heights.pop(lane)
+        for a in self._added_audios:
+            if a.lane > lane:
+                a.lane -= 1
+        # Restore the invariant that there's still one empty trailing lane.
+        self._maintain_trailing_empty_lane()
+        self.update()
+        return True
+
     def _refresh_min_height(self) -> None:
+        audio_total = sum(self._audio_lane_heights) + TRACK_GAP * len(self._audio_lane_heights)
         total = (
-            RULER_H + TRACK_GAP + self._video_h + TRACK_GAP + self._audio_h
-            + TRACK_GAP + self._audio2_h + 4
+            RULER_H + TRACK_GAP + self._video_h + audio_total + 4
         )
         self.setMinimumHeight(total)
 
@@ -170,21 +205,60 @@ class TimelineWidget(QWidget):
             self.update()
 
     def set_pixels_per_second(self, pps: float) -> None:
-        self._pps = max(MIN_PPS, min(MAX_PPS, pps))
+        new_pps = max(MIN_PPS, min(MAX_PPS, pps))
+        if abs(new_pps - self._pps) < 1e-3:
+            return
+        self._pps = new_pps
+        self.pixelsPerSecondChanged.emit(self._pps)
+        self._publish_scroll_range()
         self.update()
 
     def pixels_per_second(self) -> float:
         return self._pps
 
+    # Expose zoom bounds so the app's zoom bar maps to the same range.
+    PPS_MIN = MIN_PPS
+    PPS_MAX = MAX_PPS
+
     def set_added_audios(self, audios: list[AddedAudio]) -> None:
         """Replace the list of added-audio entries. The timeline clones each
-        entry so later edits on the app side don't silently affect painting."""
+        entry so later edits on the app side don't silently affect painting.
+
+        Lanes are grown / trimmed so there's always exactly one empty lane
+        at the bottom — drop into it and a fresh empty one slides in.
+        """
         self._added_audios = [a.clone() for a in audios]
+        self._maintain_trailing_empty_lane()
         if self._added_audio_selected_id and not any(
             a.id == self._added_audio_selected_id for a in self._added_audios
         ):
             self._added_audio_selected_id = ""
         self.update()
+
+    def _maintain_trailing_empty_lane(self) -> None:
+        """Ensure the audio-lane stack is ``[lane 0 (clip audio)] + [used
+        extra lanes] + [exactly one empty trailing lane]``.
+
+        Lanes beyond the highest-used one collapse to a single empty lane;
+        if the highest-used lane is already the last lane, a fresh empty
+        one gets appended so the user always has a drop target visible."""
+        if self._added_audios:
+            highest_used = max(a.lane for a in self._added_audios)
+        else:
+            highest_used = 0
+        # We always want at least lane 0 + one empty lane for drops. If the
+        # user is actively using lane N, we want N+1 trailing empty on top
+        # of the N+1 occupied lanes.
+        required = max(2, highest_used + 2)
+        while len(self._audio_lane_heights) < required:
+            self._audio_lane_heights.append(AUDIO_LANE_DEFAULT_H)
+        # Collapse trailing empties beyond the one we need.
+        while len(self._audio_lane_heights) > required:
+            last = len(self._audio_lane_heights) - 1
+            if any(a.lane == last for a in self._added_audios):
+                break
+            self._audio_lane_heights.pop()
+        self._refresh_min_height()
 
     def added_audios(self) -> list[AddedAudio]:
         return list(self._added_audios)
@@ -232,16 +306,24 @@ class TimelineWidget(QWidget):
         tr = self._track_rect()
         return QRect(tr.left(), RULER_H + TRACK_GAP, tr.width(), self._video_h)
 
-    def _audio_rect(self) -> QRect:
-        vr = self._video_rect()
-        return QRect(vr.left(), vr.bottom() + TRACK_GAP, vr.width(), self._audio_h)
+    def _audio_lane_rect(self, lane: int) -> QRect:
+        """Rect for audio lane `lane` (0-indexed)."""
+        tr = self._track_rect()
+        top = RULER_H + TRACK_GAP + self._video_h + TRACK_GAP
+        for i in range(lane):
+            top += self._audio_lane_heights[i] + TRACK_GAP
+        h = self._audio_lane_heights[lane] if 0 <= lane < len(self._audio_lane_heights) else AUDIO_LANE_DEFAULT_H
+        return QRect(tr.left(), top, tr.width(), h)
 
-    def _audio2_rect(self) -> QRect:
-        ar = self._audio_rect()
-        return QRect(ar.left(), ar.bottom() + TRACK_GAP, ar.width(), self._audio2_h)
+    def _audio_rect(self) -> QRect:
+        """Shortcut for lane 0 — kept as a property used by many callers."""
+        return self._audio_lane_rect(0)
+
+    def _last_audio_rect(self) -> QRect:
+        return self._audio_lane_rect(max(0, len(self._audio_lane_heights) - 1))
 
     def _va_divider_rect(self) -> QRect:
-        """Drag handle between the video and audio tracks."""
+        """Drag handle between the video and lane 0."""
         vr = self._video_rect()
         return QRect(vr.left(), vr.bottom() + 1, vr.width(), TRACK_GAP - 2)
 
@@ -277,69 +359,83 @@ class TimelineWidget(QWidget):
 
     def paintEvent(self, _event) -> None:  # noqa: ANN001
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#1a1b1f"))
+        p.fillRect(self.rect(), theme.C_RULER_BG)
 
         rr = self._ruler_rect()
         vr = self._video_rect()
-        ar = self._audio_rect()
-        ar2 = self._audio2_rect()
+        last_r = self._last_audio_rect()
 
         self._paint_ruler(p, rr)
         self._paint_video_track(p, vr)
-        self._paint_audio_track(p, ar)
-        self._paint_added_audio_track(p, ar2)
+        # Lane 0 renders clip-audio blocks + lane-0 added audio. Higher lanes
+        # are pure overlay lanes.
+        self._paint_audio_track(p, self._audio_lane_rect(0))
+        for lane in range(1, len(self._audio_lane_heights)):
+            self._paint_added_audio_track(p, self._audio_lane_rect(lane), lane)
         self._paint_chain_chips(p, vr)
         self._paint_divider(p)
 
-        # Selection band drawn ON TOP so it tints the track content (VideoPad-
-        # style). The underlying thumbnails and waveform are still visible.
+        # Selection band drawn ON TOP so it tints the track content.
         if self._sel_end > self._sel_start:
             sx = self._time_to_x(self._sel_start)
             ex = self._time_to_x(self._sel_end)
-            band = QRect(sx, rr.top(), max(1, ex - sx), ar2.bottom() - rr.top())
-            p.fillRect(band, QColor(63, 120, 200, 95))
-            pen = QPen(QColor(95, 180, 255, 230))
+            band = QRect(sx, rr.top(), max(1, ex - sx), last_r.bottom() - rr.top())
+            # Teal selection tint, matches the accent scheme.
+            p.fillRect(band, QColor(94, 234, 212, 40))
+            pen = QPen(QColor(94, 234, 212, 210))
             pen.setWidth(2)
             p.setPen(pen)
-            p.drawLine(sx, rr.top(), sx, ar2.bottom())
-            p.drawLine(ex, rr.top(), ex, ar2.bottom())
+            p.drawLine(sx, rr.top(), sx, last_r.bottom())
+            p.drawLine(ex, rr.top(), ex, last_r.bottom())
 
         # playhead on top
         ph_x = self._time_to_x(self._playhead)
         if rr.left() - 4 <= ph_x <= rr.right() + 4:
-            p.setPen(QPen(QColor("#ff5050"), 1))
-            p.drawLine(ph_x, rr.top(), ph_x, ar2.bottom())
-            p.setBrush(QColor("#ff5050"))
+            # Soft teal glow behind the playhead for the design's look.
+            glow = QColor(94, 234, 212, 70)
+            p.setPen(QPen(glow, 3))
+            p.drawLine(ph_x, rr.top(), ph_x, last_r.bottom())
+            p.setPen(QPen(theme.C_ACCENT, 1))
+            p.drawLine(ph_x, rr.top(), ph_x, last_r.bottom())
+            p.setBrush(theme.C_ACCENT)
             p.setPen(Qt.NoPen)
             p.drawPolygon([
-                QPoint(ph_x - 5, rr.top() + 2),
-                QPoint(ph_x + 5, rr.top() + 2),
+                QPoint(ph_x - 6, rr.top()),
+                QPoint(ph_x + 6, rr.top()),
                 QPoint(ph_x,     rr.top() + 10),
             ])
 
         p.end()
 
     def _paint_ruler(self, p: QPainter, rr: QRect) -> None:
-        p.fillRect(rr, QColor("#24262c"))
-        p.setPen(QColor("#3a3f4a"))
+        p.fillRect(rr, theme.C_RULER_BG)
+        p.setPen(theme.C_BORDER)
         p.drawLine(rr.bottomLeft(), rr.bottomRight())
 
         step = _choose_tick_step(self._pps)
         total = max(1.0, self._total_length() + 2.0)
-        p.setPen(QColor("#cfd0d4"))
         f = p.font(); f.setPointSize(8); p.setFont(f)
         t = 0.0
         while t < total + step:
             x = self._time_to_x(t)
             if rr.left() - 2 <= x <= rr.right() + 2:
-                p.setPen(QColor("#5a616f"))
+                p.setPen(theme.C_BORDER_HI)
                 p.drawLine(x, rr.bottom() - 6, x, rr.bottom())
-                p.setPen(QColor("#cfd0d4"))
+                p.setPen(theme.C_TEXT_3)
                 p.drawText(QPoint(x + 3, rr.bottom() - 6), _fmt_tick(t))
             t += step
 
     def _paint_video_track(self, p: QPainter, vr: QRect) -> None:
-        p.fillRect(vr, QColor("#0f1116"))
+        p.fillRect(vr, theme.C_TRACK_BG)
+        if not self._clips:
+            p.setPen(theme.C_TEXT_3)
+            f = p.font(); f.setItalic(True); p.setFont(f)
+            p.drawText(
+                vr, Qt.AlignCenter,
+                "Drag and drop video or image clips here",
+            )
+            f.setItalic(False); p.setFont(f)
+            return
         for c in self._clips:
             r = self._clip_rect(c, vr)
             if r.right() < vr.left() or r.left() > vr.right():
@@ -351,8 +447,8 @@ class TimelineWidget(QWidget):
         if clip_rect.isEmpty():
             return
 
-        # Background
-        p.fillRect(clip_rect, QColor("#23252b"))
+        # Background — dim teal-blue matching the design's video clip gradient.
+        p.fillRect(clip_rect, theme.C_VIDEO_CLIP_B)
 
         # Aspect-correct thumb tiling. The slot fractions are mapped into
         # [src_start/dur, src_end/dur] so trimmed clips show the frames that
@@ -406,9 +502,9 @@ class TimelineWidget(QWidget):
         # Selection → border only (no clip body tint, so region-select tint
         # stays clearly distinguishable from "this clip is selected").
         is_selected = c.id == self._selected_id
-        color = QColor("#5fb4ff") if is_selected else QColor("#39404d")
+        color = theme.C_ACCENT if is_selected else theme.C_VIDEO_CLIP_BD
         pen = QPen(color)
-        pen.setWidth(3 if is_selected else 1)
+        pen.setWidth(2 if is_selected else 1)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
         p.drawRect(clip_rect.adjusted(0, 0, -1, -1))
@@ -416,8 +512,9 @@ class TimelineWidget(QWidget):
         if is_selected:
             left = QRect(r.left(), r.top(), HANDLE_W, r.height()).intersected(self._video_rect())
             right = QRect(r.right() - HANDLE_W, r.top(), HANDLE_W, r.height()).intersected(self._video_rect())
-            p.fillRect(left, QColor(95, 180, 255, 200))
-            p.fillRect(right, QColor(95, 180, 255, 200))
+            handle_fill = QColor(94, 234, 212, 170)
+            p.fillRect(left, handle_fill)
+            p.fillRect(right, handle_fill)
 
     def _chain_button_rect(self, clip_rect: QRect) -> QRect:
         """Chain chip sits in the gap between the video and audio tracks,
@@ -433,11 +530,11 @@ class TimelineWidget(QWidget):
 
     def _paint_chain_icon(self, p: QPainter, rect: QRect, linked: bool) -> None:
         # Rounded chip background
-        p.setPen(QPen(QColor("#0a0c11"), 1))
-        p.setBrush(QColor(20, 22, 28, 220))
-        p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 4, 4)
+        p.setPen(QPen(theme.C_BORDER_HI, 1))
+        p.setBrush(QColor(10, 16, 19, 230))
+        p.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 5, 5)
 
-        color = QColor("#8fd47a") if linked else QColor("#ff6b6b")
+        color = theme.C_ACCENT if linked else theme.C_DANGER
         pen = QPen(color, 1.6)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
@@ -454,7 +551,7 @@ class TimelineWidget(QWidget):
 
         if not linked:
             # Diagonal break stroke
-            p.setPen(QPen(QColor("#ff6b6b"), 2))
+            p.setPen(QPen(theme.C_DANGER, 2))
             p.drawLine(rect.left() + 3, rect.bottom() - 3,
                        rect.right() - 3, rect.top() + 3)
 
@@ -463,7 +560,7 @@ class TimelineWidget(QWidget):
         if gap.height() <= 0:
             return
         # Two faint horizontal grip lines centered in the gap.
-        p.setPen(QPen(QColor("#3a414f"), 1))
+        p.setPen(QPen(theme.C_BORDER_HI, 1))
         cy = gap.center().y()
         left = gap.left() + 30
         right = gap.right() - 30
@@ -482,7 +579,7 @@ class TimelineWidget(QWidget):
             self._paint_chain_icon(p, btn, c.linked_audio)
 
     def _paint_audio_track(self, p: QPainter, ar: QRect) -> None:
-        p.fillRect(ar, QColor("#0f1116"))
+        p.fillRect(ar, theme.C_TRACK_BG)
         for c in self._clips:
             r_vid = self._clip_rect(c, self._video_rect())
             # Audio shifts horizontally by audio_offset (in seconds) when the
@@ -495,8 +592,8 @@ class TimelineWidget(QWidget):
                 continue
 
             if not c.asset.has_audio or c.audio_removed:
-                p.fillRect(r_vis, QColor("#16181d"))
-                p.setPen(QColor("#5a616f"))
+                p.fillRect(r_vis, QColor("#0a1013"))
+                p.setPen(theme.C_TEXT_3)
                 label = (
                     "(audio deleted — chain chip to restore)"
                     if c.audio_removed else "no audio"
@@ -507,22 +604,22 @@ class TimelineWidget(QWidget):
             # Linked and unlinked clip audio share the same visual
             # treatment — only the chain chip differentiates the two. The
             # selection outline colour still communicates what's selected.
-            p.fillRect(r_vis, QColor("#0d1622"))
+            p.fillRect(r_vis, theme.C_VIDEO_CLIP_B)
 
             if c.waveform_peaks and c.waveform_rate > 0:
-                self._draw_clip_waveform(p, c, r, r_vis, QColor("#5fb4ff"))
+                self._draw_clip_waveform(p, c, r, r_vis, theme.C_ACCENT)
 
             audio_selected = c.id == self._selected_audio_clip_id
             if audio_selected:
-                color = "#ffd38a"  # dragged/selected unlinked audio
+                color = theme.C_WARN  # dragged/selected unlinked audio
                 width = 2
             elif c.id == self._selected_id:
-                color = "#5fb4ff"
+                color = theme.C_ACCENT
                 width = 2
             else:
-                color = "#2a3a52"
+                color = theme.C_VIDEO_CLIP_BD
                 width = 1
-            pen = QPen(QColor(color))
+            pen = QPen(color)
             pen.setWidth(width)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
@@ -531,18 +628,18 @@ class TimelineWidget(QWidget):
         # Lane-0 added-audio entries live on Track 1 alongside clip audio.
         self._paint_added_audio_entries(p, ar, lane=0)
 
-    def _paint_added_audio_track(self, p: QPainter, ar: QRect) -> None:
-        p.fillRect(ar, QColor("#0f1116"))
-        if not any(a.lane == 1 for a in self._added_audios):
-            p.setPen(QColor("#5a616f"))
+    def _paint_added_audio_track(self, p: QPainter, ar: QRect, lane: int) -> None:
+        p.fillRect(ar, theme.C_TRACK_BG)
+        if not any(a.lane == lane for a in self._added_audios):
+            p.setPen(theme.C_TEXT_3)
             f = p.font(); f.setItalic(True); p.setFont(f)
             p.drawText(
                 ar, Qt.AlignCenter,
-                "Drag audio here for Audio Track 2 (sound effects, music, etc.)",
+                f"Drag audio here for Audio Track {lane + 1} (sound effects, music, etc.)",
             )
             f.setItalic(False); p.setFont(f)
             return
-        self._paint_added_audio_entries(p, ar, lane=1)
+        self._paint_added_audio_entries(p, ar, lane=lane)
 
     def _paint_added_audio_entries(self, p: QPainter, track_rect: QRect, lane: int) -> None:
         for audio in self._added_audios:
@@ -552,18 +649,18 @@ class TimelineWidget(QWidget):
             tile_vis = tile.intersected(track_rect)
             if tile_vis.isEmpty():
                 continue
-            p.fillRect(tile_vis, QColor("#2a1f10"))
+            p.fillRect(tile_vis, theme.C_AUDIO_CLIP_B)
             if audio.peaks and audio.rate > 0:
                 self._draw_added_audio_chunk(
                     p, audio.peaks, audio.rate,
-                    tile, tile_vis, audio.duration, QColor("#ffb067"),
+                    tile, tile_vis, audio.duration, theme.C_WARN,
                 )
             selected = audio.id == self._added_audio_selected_id
             if selected:
-                pen = QPen(QColor("#ffd38a"))
+                pen = QPen(theme.C_WARN)
                 pen.setWidth(2)
             else:
-                pen = QPen(QColor("#5a3a1a"))
+                pen = QPen(theme.C_AUDIO_CLIP_BD)
                 pen.setWidth(1)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
@@ -714,17 +811,18 @@ class TimelineWidget(QWidget):
         return QRect(r_vid.left() + offset_px, ar.top(), r_vid.width(), ar.height())
 
     def _added_audio_tile_rect(self, audio: AddedAudio) -> QRect:
-        """Rect for a single added-audio entry on its lane (Track 1 or 2)."""
-        lane_rect = self._audio_rect() if audio.lane == 0 else self._audio2_rect()
+        """Rect for a single added-audio entry on its lane."""
+        lane = max(0, min(len(self._audio_lane_heights) - 1, audio.lane))
+        lane_rect = self._audio_lane_rect(lane)
         x0 = self._time_to_x(audio.offset)
         x1 = self._time_to_x(audio.offset + max(0.01, audio.duration))
         return QRect(x0, lane_rect.top(), max(2, x1 - x0), lane_rect.height())
 
-    def _hit_added_audio(self, pos: QPoint, lane: int) -> AddedAudio | None:
-        """Topmost added-audio entry on `lane` under `pos`, iterating
-        newest-first so later additions win when two entries overlap."""
+    def _hit_added_audio(self, pos: QPoint, lane: int | None = None) -> AddedAudio | None:
+        """Topmost added-audio entry under `pos`, iterating newest-first so
+        later additions win on overlap. If `lane` is None, search all lanes."""
         for audio in reversed(self._added_audios):
-            if audio.lane != lane:
+            if lane is not None and audio.lane != lane:
                 continue
             if audio.duration <= 0 or not audio.peaks:
                 continue
@@ -733,17 +831,19 @@ class TimelineWidget(QWidget):
         return None
 
     def _lane_for_y(self, y: int) -> int:
-        """Return 0 for Audio Track 1 area, 1 for Audio Track 2 (default)."""
-        ar = self._audio_rect()
-        if ar.top() <= y <= ar.bottom():
-            return 0
-        return 1
+        """Return the audio lane index whose rect covers `y`. When `y` is
+        below the last lane, return the last lane — dragging below the
+        stack doesn't blindly create a lane (the app has an explicit
+        "+ Audio Track" button for that)."""
+        for lane in range(len(self._audio_lane_heights)):
+            r = self._audio_lane_rect(lane)
+            if r.top() <= y <= r.bottom():
+                return lane
+        return max(0, len(self._audio_lane_heights) - 1)
 
     def _hit_test(self, pos: QPoint) -> _Drag:
         rr = self._ruler_rect()
         vr = self._video_rect()
-        ar = self._audio_rect()
-        ar2 = self._audio2_rect()
         gap = self._va_divider_rect()
 
         # Chain chip lives in the gap — check it before the generic gap drag.
@@ -779,31 +879,28 @@ class TimelineWidget(QWidget):
                     return _Drag(mode="move_clip", clip_id=c.id)
             return _Drag(mode="select")
 
-        if ar.contains(pos):
+        # Walk each audio lane in order.
+        for lane in range(len(self._audio_lane_heights)):
+            lane_rect = self._audio_lane_rect(lane)
+            if not lane_rect.contains(pos):
+                continue
             if self._is_over_playhead(pos):
                 return _Drag(mode="playhead_region")
-            # Lane-0 added audio sits on top of clip audio — check it first.
-            hit_audio = self._hit_added_audio(pos, lane=0)
+            hit_audio = self._hit_added_audio(pos, lane=lane)
             if hit_audio is not None:
                 return _Drag(mode="select_added", clip_id=hit_audio.id)
-            # Unlinked clip audio block under cursor → drag it independently.
-            for c in self._clips:
-                if not c.asset.has_audio or c.audio_removed:
-                    continue
-                rect = self._audio_clip_rect(c)
-                if rect.contains(pos):
-                    if not c.linked_audio:
-                        return _Drag(mode="move_audio", clip_id=c.id)
-                    return _Drag(mode="move_clip", clip_id=c.id)
+            if lane == 0:
+                # Lane 0 also carries clip audio blocks.
+                for c in self._clips:
+                    if not c.asset.has_audio or c.audio_removed:
+                        continue
+                    rect = self._audio_clip_rect(c)
+                    if rect.contains(pos):
+                        if not c.linked_audio:
+                            return _Drag(mode="move_audio", clip_id=c.id)
+                        return _Drag(mode="move_clip", clip_id=c.id)
             return _Drag(mode="select")
 
-        if ar2.contains(pos):
-            if self._is_over_playhead(pos):
-                return _Drag(mode="playhead_region")
-            hit_audio = self._hit_added_audio(pos, lane=1)
-            if hit_audio is not None:
-                return _Drag(mode="select_added", clip_id=hit_audio.id)
-            return _Drag(mode="select")
         return _Drag(mode="select")
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -887,9 +984,10 @@ class TimelineWidget(QWidget):
             self.update()
             return
         if hit.mode == "resize_tracks":
+            lane_0_h = self._audio_lane_heights[0] if self._audio_lane_heights else AUDIO_LANE_0_H
             self._drag = _Drag(
                 mode="resize_tracks", press_x=pos.x(), press_y=pos.y(),
-                start_video_h=self._video_h, start_audio_h=self._audio_h,
+                start_video_h=self._video_h, start_audio_h=lane_0_h,
             )
             return
         if hit.mode in ("trim_l", "trim_r"):
@@ -1023,9 +1121,11 @@ class TimelineWidget(QWidget):
                          min(VIDEO_TRACK_H_MAX, self._drag.start_video_h + dy))
             new_ah = max(AUDIO_TRACK_H_MIN,
                          min(AUDIO_TRACK_H_MAX, self._drag.start_audio_h - dy))
-            if new_vh != self._video_h or new_ah != self._audio_h:
+            lane_0_h = self._audio_lane_heights[0] if self._audio_lane_heights else AUDIO_LANE_0_H
+            if new_vh != self._video_h or new_ah != lane_0_h:
                 self._video_h = new_vh
-                self._audio_h = new_ah
+                if self._audio_lane_heights:
+                    self._audio_lane_heights[0] = new_ah
                 self._refresh_min_height()
                 self.update()
 
@@ -1055,6 +1155,9 @@ class TimelineWidget(QWidget):
                 )
                 if audio is not None:
                     self.addedAudioOffsetChanged.emit(audio.id, audio.offset)
+                    # The lane may have just been populated — grow a fresh
+                    # empty lane below it so the user has a drop target.
+                    self._maintain_trailing_empty_lane()
         elif mode == "select":
             if self._sel_end > self._sel_start + 0.01:
                 self.selectionChanged.emit(self._sel_start, self._sel_end)
@@ -1081,6 +1184,7 @@ class TimelineWidget(QWidget):
             old_screen_x = int(event.position().x())
             self._pps = new_pps
             self._scroll_x = max(0, int(pivot_t * self._pps - (old_screen_x - LEFT_PAD)))
+            self.pixelsPerSecondChanged.emit(self._pps)
             self._publish_scroll_range()
             self.update()
 
@@ -1208,9 +1312,16 @@ class TimelineWidget(QWidget):
 
     def _show_context_menu(self, global_pos: QPoint, local_pos: QPoint) -> None:
         has_selection = self._sel_end > self._sel_start
+        # Resolve which audio lane was clicked (if any) so the menu can
+        # offer lane-specific actions without duplicate code.
+        clicked_lane: int | None = None
+        for lane in range(len(self._audio_lane_heights)):
+            if self._audio_lane_rect(lane).contains(local_pos):
+                clicked_lane = lane
+                break
         clicked_audio = (
-            self._hit_added_audio(local_pos)
-            if self._audio2_rect().contains(local_pos) else None
+            self._hit_added_audio(local_pos, lane=clicked_lane)
+            if clicked_lane is not None else None
         )
         menu = QMenu(self)
         if has_selection:
@@ -1224,6 +1335,8 @@ class TimelineWidget(QWidget):
         replace_action = None
         remove_this_action = None
         remove_all_action = None
+        add_lane_action = None
+        remove_lane_action = None
         if clicked_audio is not None:
             menu.addSeparator()
             replace_action = menu.addAction("Replace original audio")
@@ -1232,12 +1345,31 @@ class TimelineWidget(QWidget):
             remove_this_action = menu.addAction("Remove This Audio Clip")
             if len(self._added_audios) > 1:
                 remove_all_action = menu.addAction("Remove All Added Audio")
+        if clicked_lane is not None:
+            menu.addSeparator()
+            add_lane_action = menu.addAction("Add Audio Track")
+            # Can remove a lane only when it's empty and isn't the base lane.
+            can_remove = (
+                clicked_lane > 0
+                and not any(a.lane == clicked_lane for a in self._added_audios)
+                and len(self._audio_lane_heights) > 1
+            )
+            if can_remove:
+                remove_lane_action = menu.addAction(
+                    f"Remove Audio Track {clicked_lane + 1}",
+                )
         chosen = menu.exec(global_pos)
         if not chosen:
             return
         text = chosen.text()
         if text == "Split at Playhead":
             self.splitAtPlayheadRequested.emit()
+            return
+        if add_lane_action is not None and chosen is add_lane_action:
+            self.add_audio_lane()
+            return
+        if remove_lane_action is not None and chosen is remove_lane_action:
+            self.remove_audio_lane(clicked_lane)
             return
         if remove_this_action is not None and chosen is remove_this_action:
             self.addedAudioDeleteRequested.emit(clicked_audio.id)
@@ -1326,11 +1458,8 @@ class TimelineWidget(QWidget):
         return next((c for c in self._clips if c.id == clip_id), None)
 
     def sizeHint(self) -> QSize:
-        return QSize(
-            900,
-            RULER_H + TRACK_GAP + VIDEO_TRACK_H + TRACK_GAP + AUDIO_TRACK_H
-            + TRACK_GAP + AUDIO2_TRACK_H + 4,
-        )
+        audio_total = sum(self._audio_lane_heights) + TRACK_GAP * len(self._audio_lane_heights)
+        return QSize(900, RULER_H + TRACK_GAP + self._video_h + audio_total + 4)
 
 
 def _choose_tick_step(pps: float) -> float:
