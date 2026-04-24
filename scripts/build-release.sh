@@ -6,6 +6,10 @@
 #   - ar, tar, xz, curl
 # Downloads a static ffmpeg+ffprobe build automatically.
 #
+# Env vars:
+#   VERSION=2.0.0     # version tag used in artifact filenames
+#   SKIP_DEB=1        # build only the AppImage (iteration shortcut)
+#
 # Output lands in release/.
 set -euo pipefail
 
@@ -148,6 +152,14 @@ echo "    -> $APPIMAGE_OUT"
 # ----------------------------------------------------------------------
 # 4. .deb (manual: ar + tar.xz, no dpkg-deb dependency)
 # ----------------------------------------------------------------------
+if [ "${SKIP_DEB:-0}" = "1" ]; then
+    echo ""
+    echo "==> SKIP_DEB=1 — skipping .deb build"
+    echo "Release artifacts in $RELEASE_DIR:"
+    ls -lh "$RELEASE_DIR"
+    exit 0
+fi
+
 echo "==> Assembling .deb tree"
 PKG_ROOT="$DEB_BUILD/${APP_NAME}_${VERSION}_${DEB_ARCH}"
 rm -rf "$DEB_BUILD"

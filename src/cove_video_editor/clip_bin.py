@@ -1,12 +1,16 @@
 """Library / clip bin on the left side of the window.
 
-Holds every imported media asset. Each asset sits on one of two tabs — Videos
-or Audio — and is shown as a thumbnail tile. Double-click (or drag onto the
-timeline) to add it to the sequence. Drop files from the OS to import.
+Holds every imported media asset. Assets live on one of four tabs — Video
+Files / Audio Files / Images / Subs — and are shown as thumbnail tiles.
+Double-click (or drag onto the timeline) to add to the sequence. Drop files
+from the OS to import.
+
+In 2.0 the tab labels include live counts: e.g. ``Audio Files (1)``,
+``Images (10)``. The count is suppressed when a tab is empty.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QMimeData, QRect, QSize, Qt, Signal
+from PySide6.QtCore import QMimeData, QPointF, QRect, QSize, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -19,7 +23,6 @@ from PySide6.QtGui import (
     QPixmap,
     QPolygonF,
 )
-from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHBoxLayout,
@@ -32,6 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
 from .clip import MediaAsset
 
 
@@ -62,9 +66,17 @@ class AssetList(QListWidget):
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        # `color` on :selected is load-bearing — without it the global
+        # QSS `selection-color: ACCENT_INK` kicks in and the filename goes
+        # near-black on the dark selection bg.
         self.setStyleSheet(
-            "QListWidget { background:#1a1b1f; border:none; color:#dfe2e8; }"
-            "QListWidget::item:selected { background:#2a4c7a; border-radius:4px; }"
+            f"QListWidget {{ background:{theme.PANEL}; border:none;"
+            f" color:{theme.TEXT}; padding:6px; }}"
+            f"QListWidget::item {{ padding:4px; border-radius:6px; color:{theme.TEXT}; }}"
+            f"QListWidget::item:hover {{ background:#0f171b; color:{theme.TEXT}; }}"
+            f"QListWidget::item:selected {{"
+            f" background:#0f2a2e; border: 1px solid {theme.ACCENT};"
+            f" color:{theme.TEXT}; }}"
         )
         self._drop_highlight = False
 
@@ -154,13 +166,13 @@ class AssetList(QListWidget):
         p.setRenderHint(QPainter.Antialiasing, True)
 
         if self._drop_highlight:
-            overlay = QColor(95, 180, 255, 40)
+            overlay = QColor(94, 234, 212, 28)
             p.fillRect(vp.rect(), overlay)
 
         if self.count() == 0:
             # Large icon + text; matches the VideoPad pattern.
             cx, cy = vp.width() // 2, vp.height() // 2
-            icon_color = QColor("#3a414f") if not self._drop_highlight else QColor("#5fb4ff")
+            icon_color = theme.C_BORDER_HI if not self._drop_highlight else theme.C_ACCENT
             pen = QPen(icon_color, 3)
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
@@ -183,66 +195,122 @@ class AssetList(QListWidget):
             p.setBrush(QBrush(icon_color))
             p.drawPolygon(head)
 
-            p.setPen(QColor("#7a8294") if not self._drop_highlight else QColor("#cfe4ff"))
-            f = p.font(); f.setPointSize(11); p.setFont(f)
+            p.setPen(theme.C_TEXT_2 if not self._drop_highlight else theme.C_ACCENT)
+            f = p.font(); f.setPointSize(10); p.setFont(f)
             text_rect = QRect(0, cy + box_h // 2 - 10, vp.width(), 40)
-            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, "Drag files or folders here")
+            p.drawText(text_rect, Qt.AlignHCenter | Qt.AlignTop, "Drop files or folders")
+            p.setPen(theme.C_TEXT_3)
+            p.drawText(
+                QRect(0, cy + box_h // 2 + 10, vp.width(), 24),
+                Qt.AlignHCenter | Qt.AlignTop,
+                "or drag onto the timeline",
+            )
         p.end()
 
 
 class ClipBin(QWidget):
-    """Left-side library with Videos / Audio tabs."""
+    """Left-side library with Video Files / Audio Files / Images / Subs tabs.
 
-    assetActivated = Signal(str)         # double-click
-    assetDeleteRequested = Signal(str)   # Delete / Backspace
-    addClicked = Signal(str)             # "video" or "audio" — + buttons
-    filesDropped = Signal(list)          # list[str] — dropped from OS
+    There's deliberately no header row — users import by dragging files
+    onto a tab (or onto the main window). Each tab's empty state spells out
+    the drop hint, so a dedicated "+ Video" button is redundant.
+    """
+
+    assetActivated = Signal(str)            # double-click
+    assetDeleteRequested = Signal(str)      # Delete / Backspace on an asset
+    subDeleteRequested = Signal(str)        # Delete / Backspace on a subtitle row
+    filesDropped = Signal(list)             # list[str] — dropped from OS
+    subActivated = Signal(str)              # subtitle id (double-click = make active)
+    subStyleRequested = Signal()            # open style dialog
+    subSyncRequested = Signal()             # open auto-sync / offset dialog
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
+        self.setObjectName("CovePanel")
+        self.setMinimumWidth(280)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
-
-        header = QHBoxLayout()
-        header.setContentsMargins(6, 4, 6, 0)
-        title = QLabel("Media")
-        title.setStyleSheet("color:#dfe2e8; font-weight:600;")
-        header.addWidget(title)
-        header.addStretch(1)
-        self.add_video_btn = QPushButton("+ Video")
-        self.add_audio_btn = QPushButton("+ Audio")
-        for b in (self.add_video_btn, self.add_audio_btn):
-            b.setStyleSheet(
-                "QPushButton { background:#2a2f3a; color:#dfe2e8; border:1px solid #39404d;"
-                " border-radius:4px; padding:3px 8px; }"
-                "QPushButton:hover { background:#353c4a; }"
-            )
-        self.add_video_btn.clicked.connect(lambda: self.addClicked.emit("video"))
-        self.add_audio_btn.clicked.connect(lambda: self.addClicked.emit("audio"))
-        header.addWidget(self.add_video_btn)
-        header.addWidget(self.add_audio_btn)
-        root.addLayout(header)
+        root.setContentsMargins(1, 1, 1, 1)
+        root.setSpacing(0)
 
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setUsesScrollButtons(False)
+        self.tabs.tabBar().setExpanding(False)
         self.tabs.setStyleSheet(
-            "QTabBar::tab { background:#23252b; color:#cfd0d4; padding:4px 12px; }"
-            "QTabBar::tab:selected { background:#2a4c7a; color:white; }"
-            "QTabWidget::pane { border:1px solid #2a2f3a; background:#1a1b1f; }"
+            "QTabWidget::pane {"
+            f" border:none; background:{theme.PANEL};"
+            " border-top: 1px solid " + theme.BORDER + ";"
+            "}"
+            "QTabBar { qproperty-drawBase:0; background: #0f161a;"
+            " border-top-left-radius: 12px; border-top-right-radius: 12px; }"
+            "QTabBar::tab {"
+            f" background: transparent; color: {theme.TEXT_3};"
+            " padding: 6px 8px; margin: 4px 2px; border-radius: 6px;"
+            " font-size: 12px; font-weight: 500; min-width: 0;"
+            "}"
+            "QTabBar::tab:hover { color: " + theme.TEXT_2 + "; }"
+            "QTabBar::tab:selected {"
+            f" background: #1c272d; color: {theme.TEXT}; }}"
         )
         self.video_list = AssetList()
         self.audio_list = AssetList()
-        self.video_list.itemDoubleClicked.connect(self._on_activated)
-        self.audio_list.itemDoubleClicked.connect(self._on_activated)
-        self.video_list.deleteRequested.connect(self.assetDeleteRequested)
-        self.audio_list.deleteRequested.connect(self.assetDeleteRequested)
-        self.video_list.filesDropped.connect(self.filesDropped)
-        self.audio_list.filesDropped.connect(self.filesDropped)
-        self.tabs.addTab(self.video_list, "Videos")
-        self.tabs.addTab(self.audio_list, "Audio")
+        self.image_list = AssetList()
+        for lst in (self.video_list, self.audio_list, self.image_list):
+            lst.itemDoubleClicked.connect(self._on_activated)
+            lst.deleteRequested.connect(self.assetDeleteRequested)
+            lst.filesDropped.connect(self.filesDropped)
+        # Subs tab: a list of uploaded .srt/.vtt files with a small style
+        # button up top. The AssetList for subs emits `deleteRequested` via
+        # a dedicated signal so app.py can distinguish sub deletions from
+        # media asset deletions.
+        self.subs_list = AssetList()
+        self.subs_list.itemDoubleClicked.connect(self._on_sub_activated)
+        self.subs_list.deleteRequested.connect(self.subDeleteRequested)
+        self.subs_list.filesDropped.connect(self.filesDropped)
+        self._sub_tab = self._build_subs_tab()
+
+        # Keep references so we can relabel based on item counts. Short
+        # labels match the design mockup and keep all four tabs visible at
+        # 280 px clip-bin widths.
+        self._tabs: list[tuple[str, QListWidget | QWidget]] = [
+            ("Video", self.video_list),
+            ("Audio", self.audio_list),
+            ("Images", self.image_list),
+            ("Subs", self._sub_tab),
+        ]
+        for base, widget in self._tabs:
+            self.tabs.addTab(widget, base)
         root.addWidget(self.tabs, stretch=1)
+        self._refresh_tab_labels()
+
+    def _build_subs_tab(self) -> QWidget:
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        # Top strip with a Style… button.
+        strip = QHBoxLayout()
+        strip.setContentsMargins(6, 4, 6, 4)
+        hint = QLabel(
+            "Drop an SRT/VTT — double-click to set active for burn-in."
+        )
+        hint.setStyleSheet(f"color:{theme.TEXT_3}; font-size:11px;")
+        hint.setWordWrap(True)
+        strip.addWidget(hint, stretch=1)
+        self.sync_btn = QPushButton("Sync…")
+        self.sync_btn.setToolTip(
+            "Nudge the active subtitle, or auto-sync it to the first clip's audio."
+        )
+        self.sync_btn.clicked.connect(self.subSyncRequested)
+        strip.addWidget(self.sync_btn)
+        self.style_btn = QPushButton("Style…")
+        self.style_btn.clicked.connect(self.subStyleRequested)
+        strip.addWidget(self.style_btn)
+        lay.addLayout(strip)
+        lay.addWidget(self.subs_list, stretch=1)
+        return container
 
     # Drops on the panel outside the list (e.g. the header / tab bar)
     # still route in as imports.
@@ -257,8 +325,15 @@ class ClipBin(QWidget):
                 event.acceptProposedAction()
                 self.filesDropped.emit(paths)
 
+    def _list_for_kind(self, kind: str) -> AssetList:
+        if kind == "audio":
+            return self.audio_list
+        if kind == "image":
+            return self.image_list
+        return self.video_list
+
     def add_asset(self, asset: MediaAsset) -> None:
-        lst = self.video_list if asset.kind == "video" else self.audio_list
+        lst = self._list_for_kind(asset.kind)
         item = QListWidgetItem(asset.path.name)
         item.setData(Qt.UserRole, asset.id)
         item.setToolTip(str(asset.path))
@@ -271,17 +346,19 @@ class ClipBin(QWidget):
             item.setIcon(QIcon(_make_placeholder_pixmap(asset.kind)))
         lst.addItem(item)
         self.tabs.setCurrentWidget(lst)
+        self._refresh_tab_labels()
 
     def remove_asset(self, asset_id: str) -> None:
-        for lst in (self.video_list, self.audio_list):
+        for lst in (self.video_list, self.audio_list, self.image_list):
             for i in range(lst.count() - 1, -1, -1):
                 it = lst.item(i)
                 if it and it.data(Qt.UserRole) == asset_id:
                     lst.takeItem(i)
             lst.viewport().update()
+        self._refresh_tab_labels()
 
     def set_asset_thumb(self, asset_id: str, img) -> None:  # noqa: ANN001
-        for lst in (self.video_list, self.audio_list):
+        for lst in (self.video_list, self.audio_list, self.image_list):
             for i in range(lst.count()):
                 it = lst.item(i)
                 if it and it.data(Qt.UserRole) == asset_id:
@@ -291,24 +368,86 @@ class ClipBin(QWidget):
                     it.setIcon(QIcon(pm))
                     return
 
+    # --- Subs tab API ---------------------------------------------------
+
+    def add_sub(self, sub_id: str, name: str, tooltip: str, active: bool) -> None:
+        item = QListWidgetItem(name)
+        item.setData(Qt.UserRole, sub_id)
+        item.setToolTip(tooltip)
+        item.setIcon(QIcon(_make_placeholder_pixmap("sub", active=active)))
+        self.subs_list.addItem(item)
+        self._refresh_tab_labels()
+
+    def remove_sub(self, sub_id: str) -> None:
+        for i in range(self.subs_list.count() - 1, -1, -1):
+            it = self.subs_list.item(i)
+            if it and it.data(Qt.UserRole) == sub_id:
+                self.subs_list.takeItem(i)
+        self.subs_list.viewport().update()
+        self._refresh_tab_labels()
+
+    def set_active_sub(self, active_sub_id: str) -> None:
+        """Update every sub row to reflect which entry is the active one.
+
+        Active state is communicated by the tile icon (green CC glyph) and
+        tab selection; a prefix marker on the label would clutter the row.
+        """
+        for i in range(self.subs_list.count()):
+            it = self.subs_list.item(i)
+            if not it:
+                continue
+            sid = it.data(Qt.UserRole)
+            is_active = sid == active_sub_id
+            # Defensive cleanup for rows that may have been created by an
+            # older version of the app that prepended a marker.
+            raw = it.text().removeprefix("● ").removeprefix("○ ")
+            it.setText(raw)
+            it.setIcon(QIcon(_make_placeholder_pixmap("sub", active=is_active)))
+
     def _on_activated(self, item: QListWidgetItem) -> None:
         asset_id = item.data(Qt.UserRole)
         if asset_id:
             self.assetActivated.emit(asset_id)
 
+    def _on_sub_activated(self, item: QListWidgetItem) -> None:
+        sub_id = item.data(Qt.UserRole)
+        if sub_id:
+            self.subActivated.emit(sub_id)
 
-def _make_placeholder_pixmap(kind: str) -> QPixmap:
+    # --- tab labels -----------------------------------------------------
+
+    def _refresh_tab_labels(self) -> None:
+        counts = {
+            "Video": self.video_list.count(),
+            "Audio": self.audio_list.count(),
+            "Images": self.image_list.count(),
+            "Subs": self.subs_list.count(),
+        }
+        for idx, (base, _widget) in enumerate(self._tabs):
+            n = counts.get(base, 0)
+            label = f"{base} ({n})" if n > 0 else base
+            self.tabs.setTabText(idx, label)
+
+
+def _make_placeholder_pixmap(kind: str, *, active: bool = False) -> QPixmap:
     """Tile-sized pixmap shown before a real thumbnail is available, so the
     clip bin tiles never look like bare text."""
     pm = QPixmap(120, 68)
-    pm.fill(QColor("#1d2026"))
+    pm.fill(QColor("#05090b"))
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing, True)
-    border = QPen(QColor("#39404d"), 1)
+    border = QPen(theme.C_BORDER, 1)
     p.setPen(border)
     p.drawRect(0, 0, 119, 67)
     p.setPen(Qt.NoPen)
-    icon_color = QColor("#5fb4ff") if kind == "video" else QColor("#ffb067")
+    if kind == "video":
+        icon_color = theme.C_ACCENT
+    elif kind == "audio":
+        icon_color = theme.C_WARN
+    elif kind == "image":
+        icon_color = QColor("#b67aff")
+    else:  # sub
+        icon_color = theme.C_OK if active else theme.C_TEXT_3
     p.setBrush(icon_color)
     if kind == "video":
         # Play triangle, centered.
@@ -318,7 +457,7 @@ def _make_placeholder_pixmap(kind: str) -> QPixmap:
             QPointF(74, 34),
         ])
         p.drawPolygon(poly)
-    else:
+    elif kind == "audio":
         # Simple speaker silhouette.
         p.drawRoundedRect(48, 24, 8, 20, 1.5, 1.5)
         horn = QPolygonF([
@@ -328,5 +467,27 @@ def _make_placeholder_pixmap(kind: str) -> QPixmap:
             QPointF(56, 44),
         ])
         p.drawPolygon(horn)
+    elif kind == "image":
+        # Mountain-and-sun silhouette.
+        p.drawRect(40, 22, 40, 26)
+        p.setBrush(QColor("#1d2026"))
+        p.drawEllipse(68, 26, 7, 7)
+        p.setBrush(icon_color)
+        mountains = QPolygonF([
+            QPointF(40, 48),
+            QPointF(54, 30),
+            QPointF(62, 40),
+            QPointF(72, 28),
+            QPointF(80, 48),
+        ])
+        p.drawPolygon(mountains)
+    else:  # sub
+        # "CC"-style caption tag.
+        p.setPen(QPen(icon_color, 2))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(QRect(36, 22, 48, 26), 5, 5)
+        p.setPen(QPen(icon_color, 2))
+        p.drawLine(46, 35, 54, 35)
+        p.drawLine(66, 35, 74, 35)
     p.end()
     return pm

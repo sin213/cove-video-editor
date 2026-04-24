@@ -39,16 +39,139 @@ class AddedAudio:
 
 @dataclass
 class MediaAsset:
-    """A file in the clip bin. Independent of any timeline placement."""
+    """A file in the clip bin. Independent of any timeline placement.
+
+    Image assets carry ``kind="image"``, ``duration`` as their default
+    still-card display length (user-editable via the clip properties
+    dialog), ``has_audio=False`` and ``fps=0``. Their ``thumb`` is the
+    image itself scaled down.
+    """
     path: Path
     duration: float
     width: int
     height: int
     fps: float
     has_audio: bool
-    kind: str = "video"        # "video" or "audio"
+    kind: str = "video"        # "video" | "audio" | "image"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     thumb: QImage | None = None
+
+
+# Default duration (seconds) for a still-image clip when first dropped on
+# the timeline. Users can stretch/trim it up to IMAGE_ASSET_DURATION_CAP
+# via the properties dialog.
+DEFAULT_IMAGE_DURATION = 5.0
+# Upper bound on how long a single image clip can span — ffmpeg happily
+# loops an image for hours but a single still card longer than ten
+# minutes is probably user error.
+IMAGE_ASSET_DURATION_CAP = 600.0
+
+
+@dataclass
+class SubtitleTrack:
+    """Burn-in subtitle entry — a user-supplied SRT/VTT file plus the style
+    applied when the exporter invokes ffmpeg's ``subtitles=`` filter.
+
+    Styling maps 1:1 to libass ``force_style``. ``position="bottom"`` uses
+    the libass default alignment (2); ``"top"`` uses alignment 8.
+
+    ``cues`` is populated on import by ``parse_sub_cues`` and drives the
+    live overlay on the preview view — the same data libass sees on export.
+    """
+
+    path: Path
+    font_family: str = "Arial"
+    font_size: int = 36
+    primary_color: str = "#FFFFFF"
+    outline_color: str = "#000000"
+    outline: int = 2
+    position: str = "bottom"   # "bottom" or "top"
+    active: bool = False
+    # Manual/auto sync nudge (positive = cues show later). Applied to
+    # both the live preview and the exported burn-in.
+    offset_ms: int = 0
+    # List of (start_seconds, end_seconds, text).
+    cues: list[tuple[float, float, str]] = field(default_factory=list)
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def clone(self) -> SubtitleTrack:
+        s = SubtitleTrack(
+            path=self.path, font_family=self.font_family, font_size=self.font_size,
+            primary_color=self.primary_color, outline_color=self.outline_color,
+            outline=self.outline, position=self.position, active=self.active,
+            offset_ms=self.offset_ms, cues=list(self.cues),
+        )
+        s.id = self.id
+        return s
+
+    def cue_at(self, t: float) -> str:
+        """Return the cue text(s) covering timeline time `t`.
+
+        Multiple cues can overlap in an SRT (a second cue starts before
+        the first one ends). libass stacks them on export, so the live
+        preview joins them with a newline in file order to match — a
+        single-line return would silently drop one of the stacked cues,
+        which is why the editor showed one line while the exported file
+        showed two."""
+        shifted = t - self.offset_ms / 1000.0
+        matches = [text for start, end, text in self.cues if start <= shifted < end]
+        return "\n".join(matches)
+
+
+# ---- SRT / VTT cue parsing ------------------------------------------------
+
+import re as _re  # imported inside module; avoids a top-level `re` cost
+
+_SUB_TS_RE = _re.compile(r"(\d+):(\d+):(\d+)[,\.](\d+)")
+_SUB_RANGE_RE = _re.compile(
+    r"(\d+:\d+:\d+[,\.]\d+)\s*-->\s*(\d+:\d+:\d+[,\.]\d+)",
+)
+_SUB_TAG_RE = _re.compile(r"<[^>]+>|\{[^}]+\}")
+
+
+def parse_sub_cues(path: Path) -> list[tuple[float, float, str]]:
+    """Best-effort SRT/VTT cue parser. Returns a list of
+    ``(start_seconds, end_seconds, text)``. Unknown formats / read errors
+    produce an empty list so the rest of the app keeps working (ffmpeg
+    still handles .ass / .ssa on export even when the live preview is
+    empty)."""
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+    # Strip a WebVTT header (`WEBVTT\n\n`).
+    if raw.startswith("WEBVTT"):
+        parts = raw.split("\n\n", 1)
+        raw = parts[1] if len(parts) > 1 else ""
+    cues: list[tuple[float, float, str]] = []
+    for block in _re.split(r"\n\n+", raw.strip()):
+        lines = [line for line in block.split("\n") if line.strip()]
+        ts_idx = next((i for i, line in enumerate(lines) if "-->" in line), -1)
+        if ts_idx < 0:
+            continue
+        m = _SUB_RANGE_RE.search(lines[ts_idx])
+        if not m:
+            continue
+        start = _parse_sub_ts(m.group(1))
+        end = _parse_sub_ts(m.group(2))
+        if end <= start:
+            continue
+        text_lines = lines[ts_idx + 1:]
+        text = "\n".join(text_lines).strip()
+        text = _SUB_TAG_RE.sub("", text)
+        if text:
+            cues.append((start, end, text))
+    return cues
+
+
+def _parse_sub_ts(s: str) -> float:
+    m = _SUB_TS_RE.match(s)
+    if not m:
+        return 0.0
+    h, mm, ss, frac = m.group(1), m.group(2), m.group(3), m.group(4)
+    ms = int(frac.ljust(3, "0")[:3])
+    return int(h) * 3600 + int(mm) * 60 + int(ss) + ms / 1000.0
 
 
 @dataclass

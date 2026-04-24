@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cove-video-editor"
-version = "1.3.0"
-description = "Lightweight offline video editor: multi-clip timeline, dual audio tracks, trim / split / crop / region-delete, multi-format export"
+version = "2.0.0"
+description = "Lightweight offline video editor: multi-clip timeline, unlimited audio tracks, still-image title cards, burn-in subtitles, trim / split / crop / region-delete, multi-format export"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
