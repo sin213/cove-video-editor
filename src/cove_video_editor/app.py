@@ -681,6 +681,16 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(10)
 
+        main_split = QSplitter(Qt.Vertical)
+        main_split.setChildrenCollapsible(False)
+        main_split.setHandleWidth(6)
+        root.addWidget(main_split, stretch=1)
+
+        preview_panel = QWidget()
+        preview_lay = QVBoxLayout(preview_panel)
+        preview_lay.setContentsMargins(0, 0, 0, 0)
+        preview_lay.setSpacing(10)
+
         # top splitter: bin | preview
         top_split = QSplitter(Qt.Horizontal)
         top_split.setChildrenCollapsible(False)
@@ -717,7 +727,7 @@ class MainWindow(QMainWindow):
         top_split.setStretchFactor(0, 0)
         top_split.setStretchFactor(1, 1)
         top_split.setSizes([300, 1120])
-        root.addWidget(top_split, stretch=1)
+        preview_lay.addWidget(top_split, stretch=1)
 
         # Added-audio mode controls — no UI; we default to "mix with equal
         # gains" and flip to replace mode via the audio-track context menu.
@@ -847,11 +857,16 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.crop_reset_btn)
         transport.addStretch(1)
         transport.addWidget(self.range_label)
-        root.addWidget(transport_bar)
+        preview_lay.addWidget(transport_bar)
+        main_split.addWidget(preview_panel)
+
+        timeline_panel = QWidget()
+        timeline_lay = QVBoxLayout(timeline_panel)
+        timeline_lay.setContentsMargins(0, 0, 0, 0)
+        timeline_lay.setSpacing(10)
 
         # --- timeline
         self.timeline = TimelineWidget()
-        self.timeline.setMinimumHeight(200)
         self.timeline.playheadMoved.connect(self._on_timeline_playhead)
         self.timeline.clipSelected.connect(self._on_clip_selected)
         self.timeline.rangeChanged.connect(self._on_clip_range_changed)
@@ -874,7 +889,7 @@ class MainWindow(QMainWindow):
         self.timeline.clipAudioRemoveRequested.connect(self._on_clip_audio_remove_requested)
         self.timeline.scrollRangeChanged.connect(self._on_timeline_scroll_range)
         self.timeline.scrollValueChanged.connect(self._on_timeline_scroll_value)
-        root.addWidget(self.timeline, stretch=0)
+        timeline_lay.addWidget(self.timeline, stretch=1)
 
         # Scrollbar + VideoPad-style zoom bar share one row. Scrollbar
         # stretches; the zoom cluster sits on the right with a fixed width.
@@ -906,7 +921,7 @@ class MainWindow(QMainWindow):
         self.zoom_in_btn.clicked.connect(self._zoom_in_clicked)
         sb_row.addWidget(self.zoom_in_btn)
 
-        root.addWidget(sb_bar)
+        timeline_lay.addWidget(sb_bar)
 
         # Sync slider when the user wheel-zooms on the timeline.
         self.timeline.pixelsPerSecondChanged.connect(self._sync_zoom_slider)
@@ -948,7 +963,11 @@ class MainWindow(QMainWindow):
         self.export_btn.clicked.connect(self._on_export_clicked)
         bottom.addWidget(self.export_btn)
 
-        root.addWidget(export_bar)
+        timeline_lay.addWidget(export_bar)
+        main_split.addWidget(timeline_panel)
+        main_split.setStretchFactor(0, 3)
+        main_split.setStretchFactor(1, 1)
+        main_split.setSizes([520, 260])
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
