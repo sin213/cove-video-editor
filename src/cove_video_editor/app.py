@@ -96,6 +96,7 @@ from .clip import (
 )
 from .clip_bin import ASSET_MIME, ClipBin
 from .crop_overlay import CropOverlay
+from .downloader import DownloadVideoDialog
 from .exporter import AudioTrack, ExportJob, start_export
 from .thumbnails import start_thumbnails, start_waveform
 from .timeline_widget import TimelineWidget
@@ -443,6 +444,7 @@ class MainWindow(QMainWindow):
         self._added_wave_workers: dict[str, object] = {}
         self._export_thread: QThread | None = None
         self._export_worker = None
+        self._download_dialog: DownloadVideoDialog | None = None
         # List of added-audio clips on the mix track; each has its own player.
         self._added_audios: list[AddedAudio] = []
         self._added_players: dict[str, QMediaPlayer] = {}
@@ -840,6 +842,9 @@ class MainWindow(QMainWindow):
         self.merge_btn.clicked.connect(self._on_merge_button_clicked)
         self.delete_clip_btn = QPushButton("Delete clip")
         self.delete_clip_btn.clicked.connect(self._delete_selected_clip)
+        self.download_video_btn = QPushButton("Download Video")
+        self.download_video_btn.setToolTip("Download a video from a URL and add it at the playhead")
+        self.download_video_btn.clicked.connect(self._on_download_video_clicked)
         self.crop_btn = QPushButton("Crop")
         self.crop_btn.setCheckable(True)
         self.crop_btn.toggled.connect(self._on_crop_toggled)
@@ -852,6 +857,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.split_btn)
         transport.addWidget(self.merge_btn)
         transport.addWidget(self.delete_clip_btn)
+        transport.addWidget(self.download_video_btn)
         transport.addSpacing(4)
         transport.addWidget(self.crop_btn)
         transport.addWidget(self.crop_reset_btn)
@@ -1014,6 +1020,52 @@ class MainWindow(QMainWindow):
             self.crop_overlay.setGeometry(r)
             self.crop_overlay.raise_()
         return super().eventFilter(obj, event)
+
+    # --- video download ------------------------------------------------
+
+    def _on_download_video_clicked(self) -> None:
+        existing = self._download_dialog
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+
+        ffmpeg_path: str | None = None
+        try:
+            ffmpeg_path = ff.require_ffmpeg()
+        except ff.FFmpegMissingError:
+            # The startup dependency check already reports this; let yt-dlp
+            # still try sites/formats that do not need a merge step.
+            ffmpeg_path = None
+
+        dlg = DownloadVideoDialog(self, ffmpeg_path=ffmpeg_path)
+        dlg.downloadFinished.connect(self._on_download_video_finished)
+
+        def _clear_dialog(_result: int) -> None:
+            if self._download_dialog is dlg:
+                self._download_dialog = None
+
+        dlg.finished.connect(_clear_dialog)
+        self._download_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_download_video_finished(self, path: Path) -> None:
+        insert_t = self.timeline.playhead()
+        existing = next((a for a in self._assets.values() if a.path == path), None)
+        if existing is None:
+            self._import_paths([path], append_to_timeline=False)
+            existing = next((a for a in self._assets.values() if a.path == path), None)
+        if existing is None or existing.kind != "video":
+            QMessageBox.warning(
+                self,
+                "Import failed",
+                f"Downloaded file could not be imported: {path.name}",
+            )
+            return
+        self._insert_clip_at(existing.id, insert_t)
+        self.status.showMessage(f"Downloaded and added {path.name}.", 6000)
 
     # --- importing ----------------------------------------------------
 
@@ -2615,6 +2667,9 @@ class MainWindow(QMainWindow):
                 self._export_worker.cancel()
             except Exception:  # noqa: BLE001
                 pass
+        if self._download_dialog is not None:
+            self._download_dialog.cancel_and_wait()
+            self._download_dialog.close()
         for d in (self._thumb_threads, self._wave_threads, self._added_wave_threads):
             for thread in list(d.values()):
                 if thread.isRunning():
