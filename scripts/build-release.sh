@@ -7,7 +7,7 @@
 # Downloads a static ffmpeg+ffprobe build automatically.
 #
 # Env vars:
-#   VERSION=2.0.0     # version tag used in artifact filenames
+#   VERSION=2.1.0     # version tag used in artifact filenames
 #   SKIP_DEB=1        # build only the AppImage (iteration shortcut)
 #
 # Output lands in release/.
