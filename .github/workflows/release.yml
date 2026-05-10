@@ -54,18 +54,31 @@ jobs:
           chmod +x scripts/build-release.sh
           bash scripts/build-release.sh
 
+      - name: Generate SHA256 sidecars
+        run: |
+          cd release
+          for f in *.AppImage *.deb; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la *.sha256
+
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
-          path: release/*.AppImage
+          path: |
+            release/*.AppImage
+            release/*.AppImage.sha256
           if-no-files-found: error
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: linux-deb
-          path: release/*.deb
+          path: |
+            release/*.deb
+            release/*.deb.sha256
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -74,7 +87,9 @@ jobs:
         with:
           files: |
             release/*.AppImage
+            release/*.AppImage.sha256
             release/*.deb
+            release/*.deb.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
 
@@ -95,18 +110,32 @@ jobs:
         shell: pwsh
         run: .\build.ps1 -Version $env:VERSION
 
+      - name: Generate SHA256 sidecars
+        shell: bash
+        run: |
+          cd release
+          for f in *-Setup.exe *-Portable.exe; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -la *.sha256
+
       - name: Upload Setup installer
         uses: actions/upload-artifact@v4
         with:
           name: windows-setup
-          path: release/*-Setup.exe
+          path: |
+            release/*-Setup.exe
+            release/*-Setup.exe.sha256
           if-no-files-found: error
 
       - name: Upload Portable exe
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: release/*-Portable.exe
+          path: |
+            release/*-Portable.exe
+            release/*-Portable.exe.sha256
           if-no-files-found: error
 
       - name: Attach to GitHub Release
@@ -115,6 +144,8 @@ jobs:
         with:
           files: |
             release/*-Setup.exe
+            release/*-Setup.exe.sha256
             release/*-Portable.exe
+            release/*-Portable.exe.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
