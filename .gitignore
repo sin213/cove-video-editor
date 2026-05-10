@@ -9,3 +9,7 @@ release/
 *.spec
 .DS_Store
 cove_icon.ico
+
+# Local workflow notes
+RELEASES.md
+WORKFLOW.md
