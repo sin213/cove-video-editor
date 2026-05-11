@@ -4,7 +4,7 @@
 # Requires:
 #   - python3 (with pip)
 #   - ar, tar, xz, curl
-# Downloads a static ffmpeg+ffprobe build automatically.
+# Downloads static ffmpeg+ffprobe and yt-dlp builds automatically.
 #
 # Env vars:
 #   VERSION=2.1.0     # version tag used in artifact filenames
@@ -45,7 +45,7 @@ python3 -m venv "$BUILD_ENV"
 "$BUILD_ENV/bin/pip" install --quiet -r requirements.txt pyinstaller
 
 # ----------------------------------------------------------------------
-# 1. Download ffmpeg + ffprobe static build
+# 1. Download ffmpeg + ffprobe static build and yt-dlp
 # ----------------------------------------------------------------------
 echo "==> Fetching ffmpeg static build"
 FF_TMP="$ROOT/build/ff"
@@ -58,6 +58,13 @@ FFMPEG_BIN="$(find "$FF_TMP" -type f -name ffmpeg | head -1)"
 FFPROBE_BIN="$(find "$FF_TMP" -type f -name ffprobe | head -1)"
 [ -n "$FFMPEG_BIN" ]  || { echo "ffmpeg not found after extract";  exit 1; }
 [ -n "$FFPROBE_BIN" ] || { echo "ffprobe not found after extract"; exit 1; }
+
+echo "==> Fetching standalone yt-dlp"
+YTDLP_BIN="$ROOT/build/yt-dlp"
+curl -fL --retry 3 --silent --show-error \
+    -o "$YTDLP_BIN" \
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+chmod +x "$YTDLP_BIN"
 
 # ----------------------------------------------------------------------
 # 2. PyInstaller
@@ -82,6 +89,7 @@ echo "==> Running PyInstaller"
     --exclude-module tkinter \
     --add-binary "${FFMPEG_BIN}:." \
     --add-binary "${FFPROBE_BIN}:." \
+    --add-binary "${YTDLP_BIN}:." \
     packaging/launcher.py
 
 BUNDLE="$DIST_DIR/$APP_NAME"
@@ -97,6 +105,7 @@ mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib/$APP_NAME" \
          "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 
 cp -r "$BUNDLE"/. "$APPDIR/usr/lib/$APP_NAME/"
+chmod +x "$APPDIR/usr/lib/$APP_NAME/_internal/yt-dlp"
 cp "$ICON_SRC" "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP_NAME.png"
 cp "$ICON_SRC" "$APPDIR/$APP_NAME.png"
 cp "$ICON_SRC" "$APPDIR/.DirIcon" 2>/dev/null || true
@@ -171,6 +180,7 @@ mkdir -p "$PKG_ROOT/DEBIAN" \
          "$PKG_ROOT/usr/share/doc/$APP_NAME"
 
 cp -r "$BUNDLE"/. "$PKG_ROOT/usr/lib/$APP_NAME/"
+chmod +x "$PKG_ROOT/usr/lib/$APP_NAME/_internal/yt-dlp"
 cp "$ICON_SRC" "$PKG_ROOT/usr/share/icons/hicolor/256x256/apps/$APP_NAME.png"
 
 cat > "$PKG_ROOT/usr/bin/$APP_NAME" <<EOF

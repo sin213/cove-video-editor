@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
     Build Cove Video Editor into a Windows Setup installer and a single-file
-    portable executable. Both artifacts bundle ffmpeg and ffprobe.
+    portable executable. Both artifacts bundle ffmpeg, ffprobe, and yt-dlp.
 
 .DESCRIPTION
     Runs locally on Windows (PowerShell 5.1+ or PowerShell 7) and inside the
     GitHub Actions windows-latest runner. Creates a private venv, installs
     build deps, generates the .ico from the PNG, downloads the gyan.dev ffmpeg
-    release-essentials build, then runs PyInstaller twice:
+    release-essentials build and standalone yt-dlp, then runs PyInstaller twice:
       * --onedir  for the Inno Setup installer (Setup.exe)
       * --onefile for the standalone Portable.exe
 
@@ -27,6 +27,7 @@ Set-StrictMode -Version Latest
 $App        = "cove-video-editor"
 $ReleaseDir = "release"
 $FfmpegUrl  = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+$YtDlpUrl   = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 
 function Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 
@@ -57,7 +58,7 @@ Image.open('cove_icon.png').save(
 )
 "@
 
-# --- 3. Download ffmpeg + ffprobe --------------------------------------------
+# --- 3. Download ffmpeg + ffprobe + yt-dlp -----------------------------------
 
 Step "[3/7] Downloading ffmpeg (gyan.dev release-essentials)"
 $ffTmp = Join-Path ([IO.Path]::GetTempPath()) ("ffmpeg-" + [Guid]::NewGuid())
@@ -76,6 +77,11 @@ $ffprobeExe    = Join-Path $ffRoot.FullName "bin\ffprobe.exe"
 $ffmpegLicense = Join-Path $ffRoot.FullName "LICENSE"
 if (-not (Test-Path $ffmpegExe))  { throw "ffmpeg.exe missing from downloaded archive"  }
 if (-not (Test-Path $ffprobeExe)) { throw "ffprobe.exe missing from downloaded archive" }
+
+Step "[3/7] Downloading yt-dlp"
+$ytDlpExe = Join-Path $ffTmp "yt-dlp.exe"
+Download-File $YtDlpUrl $ytDlpExe
+if (-not (Test-Path $ytDlpExe)) { throw "yt-dlp.exe missing after download" }
 
 # --- 4. PyInstaller: one-dir (installer input) --------------------------------
 
@@ -103,6 +109,7 @@ $commonArgs = @(
     '--exclude-module', 'tkinter',
     '--add-binary', ($ffmpegExe  + [IO.Path]::PathSeparator + '.'),
     '--add-binary', ($ffprobeExe + [IO.Path]::PathSeparator + '.'),
+    '--add-binary', ($ytDlpExe   + [IO.Path]::PathSeparator + '.'),
     'packaging\launcher.py'
 )
 
@@ -141,6 +148,7 @@ $portableName = "$App-portable"
     --exclude-module tkinter `
     --add-binary ($ffmpegExe  + [IO.Path]::PathSeparator + '.') `
     --add-binary ($ffprobeExe + [IO.Path]::PathSeparator + '.') `
+    --add-binary ($ytDlpExe   + [IO.Path]::PathSeparator + '.') `
     packaging\launcher.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller (onefile) failed" }
 

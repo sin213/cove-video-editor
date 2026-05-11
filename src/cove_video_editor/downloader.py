@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -49,12 +50,29 @@ QUALITY_FORMATS = {
 
 
 def _yt_dlp_command() -> list[str] | None:
+    exe_name = "yt-dlp.exe" if os.name == "nt" else "yt-dlp"
+    for directory in _yt_dlp_dirs():
+        candidate = directory / exe_name
+        if candidate.is_file():
+            return [str(candidate)]
+
     exe = shutil.which("yt-dlp")
     if exe:
         return [exe]
     if importlib.util.find_spec("yt_dlp") is not None:
         return [sys.executable, "-m", "yt_dlp"]
     return None
+
+
+def _yt_dlp_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        dirs.append(Path(meipass))
+    if getattr(sys, "frozen", False):
+        dirs.append(Path(sys.executable).resolve().parent)
+    dirs.append(Path(__file__).resolve().parent.parent.parent / "assets" / "bin")
+    return dirs
 
 
 class DownloadWorker(QObject):

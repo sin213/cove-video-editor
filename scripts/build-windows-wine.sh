@@ -31,7 +31,7 @@ WIN_PY="C:\\users\\sin\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
 PY_UNIX="$WINEPREFIX/drive_c/users/sin/AppData/Local/Programs/Python/Python312/python.exe"
 [ -x "$PY_UNIX" ] || { echo "Wine Python not found at $PY_UNIX"; exit 1; }
 
-# ---------------------------------------------------------------- 1. ffmpeg
+# ---------------------------------------------------------------- 1. ffmpeg + yt-dlp
 FF_DIR="$ROOT/build/ff-win"
 if [ ! -f "$FF_DIR/bin/ffmpeg.exe" ]; then
   echo "==> Downloading Windows ffmpeg (gyan.dev release-essentials)"
@@ -51,6 +51,15 @@ FFMPEG_EXE="$FF_DIR/bin/ffmpeg.exe"
 FFPROBE_EXE="$FF_DIR/bin/ffprobe.exe"
 FFMPEG_LICENSE="$FF_DIR/LICENSE"
 [ -f "$FFMPEG_EXE" ] || { echo "ffmpeg.exe missing after extract"; exit 1; }
+
+YTDLP_EXE="$ROOT/build/yt-dlp.exe"
+if [ ! -f "$YTDLP_EXE" ]; then
+  echo "==> Downloading standalone Windows yt-dlp"
+  curl -fL --retry 3 --silent --show-error \
+    -o "$YTDLP_EXE" \
+    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+fi
+[ -f "$YTDLP_EXE" ] || { echo "yt-dlp.exe missing after download"; exit 1; }
 
 # Wine-side paths (win-style with drive letter)
 FFMPEG_WIN=$(winepath -w "$FFMPEG_EXE")
@@ -91,6 +100,7 @@ COMMON_ARGS=(
   --exclude-module tkinter
   --add-binary "${FFMPEG_EXE};."
   --add-binary "${FFPROBE_EXE};."
+  --add-binary "${YTDLP_EXE};."
   packaging/launcher.py
 )
 
