@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,6 +20,9 @@ if os.name == "nt":
     _POPEN_KWARGS: dict = {"creationflags": _CREATE_NO_WINDOW}
 else:
     _POPEN_KWARGS = {}
+
+
+_FILTER_LABEL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass
@@ -311,17 +315,29 @@ class ExportWorker(QObject):
         v_out: str | None = None
         a_out: str | None = None
         if not is_audio_only:
-            v_in = "".join(f"[{lbl}]" for lbl in v_labels)
+            if len(v_labels) != n:
+                raise RuntimeError(
+                    f"internal export error: expected {n} video labels, got {len(v_labels)}"
+                )
             if needs_audio:
-                a_in = "".join(f"[{lbl}]" for lbl in a_labels)
-                parts.append(f"{v_in}{a_in}concat=n={n}:v=1:a=1[vc][ac]")
+                if len(a_labels) != n:
+                    raise RuntimeError(
+                        f"internal export error: expected {n} audio labels, got {len(a_labels)}"
+                    )
+                parts.append(
+                    f"{_join_filter_labels(v_labels)}{_join_filter_labels(a_labels)}"
+                    f"concat=n={n}:v=1:a=1[vc][ac]"
+                )
                 v_out, a_out = "vc", "ac"
             else:
-                parts.append(f"{v_in}concat=n={n}:v=1:a=0[vc]")
+                parts.append(f"{_join_filter_labels(v_labels)}concat=n={n}:v=1:a=0[vc]")
                 v_out = "vc"
         else:
-            a_in = "".join(f"[{lbl}]" for lbl in a_labels)
-            parts.append(f"{a_in}concat=n={n}:v=0:a=1[ac]")
+            if len(a_labels) != n:
+                raise RuntimeError(
+                    f"internal export error: expected {n} audio labels, got {len(a_labels)}"
+                )
+            parts.append(f"{_join_filter_labels(a_labels)}concat=n={n}:v=0:a=1[ac]")
             a_out = "ac"
 
         # Added-audio tracks: each placed at its offset, plays for its own
@@ -457,6 +473,14 @@ def _segments_with_gaps(clips: list[Clip], end: float) -> list[tuple[str, float,
     if end > cursor + 1e-3:
         out.append(("gap", cursor, end, None))
     return out
+
+
+def _join_filter_labels(labels: list[str]) -> str:
+    """Return ffmpeg link labels, accepting only generated filter labels."""
+    for label in labels:
+        if _FILTER_LABEL_RE.fullmatch(label) is None:
+            raise RuntimeError(f"internal export error: invalid concat label {label!r}")
+    return "".join(f"[{label}]" for label in labels)
 
 
 def _render_ass(sub: SubtitleTrack, out_w: int, out_h: int) -> str:
