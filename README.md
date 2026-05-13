@@ -19,6 +19,24 @@ artifacts via GitHub Actions.
 
 ---
 
+## What's new in v2.1.2
+
+- **Collapsible export log** — a "Details ▸" toggle next to the export
+  controls reveals the full ffmpeg command, live progress lines, and any
+  stderr output. Auto-expands on failure; collapses cleanly when not needed.
+  One-click "Copy log" for pasting into bug reports.
+- **Export deadlock fix** — stderr is now drained on a background thread so
+  VP9/WebM and other verbose encoders can no longer fill the OS pipe buffer
+  and hang the export at "starting…".
+- **AVI/MP3 image-clip fix** — still images exported to AVI now produce valid
+  audio (44 100 Hz, fltp, stereo) so libmp3lame no longer bails with "Could
+  not open encoder before EOF".
+- **`-nostdin` + `DEVNULL`** — ffmpeg never waits for terminal input, making
+  automated and headless exports fully reliable.
+- **Smoke-test script** (`scripts/smoke-export-formats.py`) — exercises all
+  9 export formats against video, no-audio, still-image, gap, and added-audio
+  timelines; validates stream presence and packet count via ffprobe.
+
 ## What's new in v2.1.0
 
 - **Download Video workflow** — new toolbar button opens a native PySide6
