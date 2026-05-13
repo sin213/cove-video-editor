@@ -185,6 +185,38 @@ QPushButton#GhostButton:hover {{
     border-color: {ACCENT};
 }}
 
+QPushButton#FlatButton {{
+    background: transparent;
+    color: {TEXT_2};
+    border: none;
+    padding: 3px 8px;
+    font-size: 11px;
+}}
+QPushButton#FlatButton:hover {{
+    color: {TEXT};
+    background: {PANEL_HI};
+    border-radius: 4px;
+}}
+QPushButton#FlatButton:checked {{
+    color: {ACCENT};
+}}
+
+QFrame#ExportLogPanel {{
+    background: #0a1013;
+    border: 1px solid {BORDER};
+    border-top: none;
+    border-radius: 0 0 8px 8px;
+}}
+QTextEdit#ExportLog {{
+    background: #060c0f;
+    color: {TEXT_2};
+    border: none;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-family: "{mono}";
+    font-size: 11px;
+}}
+
 QToolButton {{
     background: transparent;
     color: {TEXT_2};

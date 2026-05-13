@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTextEdit,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -963,6 +964,14 @@ class MainWindow(QMainWindow):
         self.cancel_btn.clicked.connect(self._on_cancel_clicked)
         bottom.addWidget(self.cancel_btn)
 
+        self.details_btn = QPushButton("Details ▸")
+        self.details_btn.setObjectName("FlatButton")
+        self.details_btn.setCheckable(True)
+        self.details_btn.setChecked(False)
+        self.details_btn.setFixedHeight(28)
+        self.details_btn.clicked.connect(self._on_details_toggled)
+        bottom.addWidget(self.details_btn)
+
         self.export_btn = QPushButton("Export")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.setMinimumHeight(34)
@@ -970,6 +979,31 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.export_btn)
 
         timeline_lay.addWidget(export_bar)
+
+        # Collapsible export log — hidden by default, toggled by details_btn.
+        self._log_panel = QFrame()
+        self._log_panel.setObjectName("ExportLogPanel")
+        log_lay = QVBoxLayout(self._log_panel)
+        log_lay.setContentsMargins(14, 6, 14, 10)
+        log_lay.setSpacing(6)
+
+        self.export_log = QTextEdit()
+        self.export_log.setReadOnly(True)
+        self.export_log.setObjectName("ExportLog")
+        self.export_log.setFixedHeight(130)
+        self.export_log.setLineWrapMode(QTextEdit.NoWrap)
+        self.export_log.document().setMaximumBlockCount(500)
+        log_lay.addWidget(self.export_log)
+
+        copy_log_btn = QPushButton("Copy log")
+        copy_log_btn.setObjectName("FlatButton")
+        copy_log_btn.setFixedHeight(24)
+        copy_log_btn.clicked.connect(self._on_copy_log)
+        log_lay.addWidget(copy_log_btn, alignment=Qt.AlignRight)
+
+        self._log_panel.setVisible(False)
+        timeline_lay.addWidget(self._log_panel)
+
         main_split.addWidget(timeline_panel)
         main_split.setStretchFactor(0, 3)
         main_split.setStretchFactor(1, 1)
@@ -2578,6 +2612,7 @@ class MainWindow(QMainWindow):
         self.progress.setFormat("starting…")
         self.export_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
+        self.export_log.clear()
         self.status.showMessage("Exporting…")
 
         thread, worker = start_export(job)
@@ -2596,8 +2631,18 @@ class MainWindow(QMainWindow):
             self._export_worker.cancel()
             self.status.showMessage("Cancelling…")
 
+    def _on_details_toggled(self, checked: bool) -> None:
+        self._log_panel.setVisible(checked)
+        self.details_btn.setText("Details ▾" if checked else "Details ▸")
+
+    def _on_copy_log(self) -> None:
+        QApplication.clipboard().setText(self.export_log.toPlainText())
+
     def _on_worker_log(self, msg: str) -> None:
-        self.status.showMessage(msg, 4000)
+        self.export_log.append(msg)
+        # Show the first command line in status bar; suppress noisy stderr lines.
+        if msg.startswith("$ "):
+            self.status.showMessage(msg, 4000)
 
     def _on_progress(self, pct: int) -> None:
         self._last_progress = max(self._last_progress, pct)
@@ -2621,15 +2666,27 @@ class MainWindow(QMainWindow):
         size, unit = (size_b / 1024, "KB")
         if size >= 1024:
             size, unit = (size / 1024, "MB")
-        self.status.showMessage(f"Saved {out.name} ({size:.1f} {unit})", 8000)
+        summary = f"Saved {out.name} ({size:.1f} {unit})"
+        self.status.showMessage(summary, 8000)
+        self.export_log.append(f"✓ {summary}")
         self._last_progress = 100
         self._last_eta = None
         self.progress.setValue(100)
         self.progress.setFormat("%p%")
 
     def _on_export_failed(self, msg: str) -> None:
-        self.status.showMessage(f"Failed: {msg}", 8000)
-        QMessageBox.warning(self, "Export failed", msg)
+        # First line as short status; full detail goes to the log panel.
+        short = msg.splitlines()[0][:120] if msg else "Unknown error"
+        self.status.showMessage(f"Failed: {short}", 8000)
+        self.export_log.append(f"✗ {msg}")
+        # Auto-expand Details so the user can see what went wrong.
+        if not self.details_btn.isChecked():
+            self.details_btn.setChecked(True)
+            self._on_details_toggled(True)
+        QMessageBox.warning(
+            self, "Export failed",
+            f"{short}\n\nSee Details for the full ffmpeg log.",
+        )
 
     def _reset_after_export(self) -> None:
         self._export_thread = None

@@ -13,9 +13,9 @@ artifacts via GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.1.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.1.2-5eead4?style=flat-square)
 
-![Cove Video Editor v2.1.0](docs/screenshot.png)
+![Cove Video Editor v2.1.2](docs/screenshot.png)
 
 ---
 
@@ -295,13 +295,13 @@ Both Linux scripts download ffmpeg automatically.
 ### Linux — AppImage + .deb
 
 ```bash
-VERSION=2.1.0 bash scripts/build-release.sh
+VERSION=2.1.2 bash scripts/build-release.sh
 # Output in release/:
-#   Cove-Video-Editor-2.1.0-x86_64.AppImage
-#   cove-video-editor_2.1.0_amd64.deb
+#   Cove-Video-Editor-2.1.2-x86_64.AppImage
+#   cove-video-editor_2.1.2_amd64.deb
 ```
 
-`SKIP_DEB=1 VERSION=2.1.0 bash scripts/build-release.sh` builds just the
+`SKIP_DEB=1 VERSION=2.1.2 bash scripts/build-release.sh` builds just the
 AppImage.
 
 ### Windows — Setup.exe + Portable.exe (native)
@@ -310,10 +310,10 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) (pre-installed on
 GitHub Actions' `windows-latest`).
 
 ```powershell
-.\build.ps1 -Version 2.1.0
+.\build.ps1 -Version 2.1.2
 # Output in release\:
-#   cove-video-editor-2.1.0-Setup.exe
-#   cove-video-editor-2.1.0-Portable.exe
+#   cove-video-editor-2.1.2-Setup.exe
+#   cove-video-editor-2.1.2-Portable.exe
 ```
 
 ### Windows — Setup.exe + Portable.exe (from Linux, via Wine)
@@ -323,15 +323,15 @@ prefix on first run: Python 3.12 for Windows, PySide6, Pillow, PyInstaller,
 and Inno Setup 6. Subsequent runs reuse the prefix.
 
 ```bash
-VERSION=2.1.0 bash scripts/build-windows-wine.sh
+VERSION=2.1.2 bash scripts/build-windows-wine.sh
 # Output in release/:
-#   cove-video-editor-2.1.0-Setup.exe
-#   cove-video-editor-2.1.0-Portable.exe
+#   cove-video-editor-2.1.2-Setup.exe
+#   cove-video-editor-2.1.2-Portable.exe
 ```
 
 ### Automated release via GitHub Actions
 
-Push a tag matching `v*` (e.g. `v2.1.0`) and `.github/workflows/release.yml`
+Push a tag matching `v*` (e.g. `v2.1.2`) and `.github/workflows/release.yml`
 runs the Linux + Windows jobs in parallel and attaches all four artifacts to
 the GitHub Release created for the tag.
 

@@ -17,7 +17,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="${VERSION:-2.1.0}"
+VERSION="${VERSION:-2.1.2}"
 APP="cove-video-editor"
 RELEASE_DIR="$ROOT/release"
 mkdir -p "$RELEASE_DIR"

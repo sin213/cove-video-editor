@@ -144,7 +144,7 @@ EXPORT_FORMATS: dict[str, dict] = {
     "MKV (H.264 + AAC)":   {"ext": "mkv",  "vcodec": "libx264",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p"]},
     "WebM (VP9 + Opus)":   {"ext": "webm", "vcodec": "libvpx-vp9", "acodec": "libopus",   "extra": ["-b:v", "0", "-crf", "32", "-row-mt", "1"]},
     "MOV (H.264 + AAC)":   {"ext": "mov",  "vcodec": "libx264",  "acodec": "aac",         "extra": ["-pix_fmt", "yuv420p"]},
-    "AVI (MPEG-4 + MP3)":  {"ext": "avi",  "vcodec": "mpeg4",    "acodec": "libmp3lame",  "extra": ["-qscale:v", "4"]},
+    "AVI (MPEG-4 + MP3)":  {"ext": "avi",  "vcodec": "mpeg4",    "acodec": "libmp3lame",  "extra": ["-qscale:v", "4", "-ar", "44100", "-ac", "2"]},
     "GIF (animation)":     {"ext": "gif",  "vcodec": "gif",      "acodec": None,           "extra": []},
     "MP3 (audio only)":    {"ext": "mp3",  "vcodec": None,       "acodec": "libmp3lame",   "extra": ["-q:a", "2"]},
     "WAV (audio only)":    {"ext": "wav",  "vcodec": None,       "acodec": "pcm_s16le",    "extra": []},

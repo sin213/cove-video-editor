@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import collections
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -163,7 +165,7 @@ class ExportWorker(QObject):
         tgt_w -= tgt_w % 2
         tgt_h -= tgt_h % 2
 
-        cmd: list[str] = [ff.require_ffmpeg(), "-y", "-hide_banner",
+        cmd: list[str] = [ff.require_ffmpeg(), "-nostdin", "-y", "-hide_banner",
                           "-progress", "pipe:1", "-nostats", "-loglevel", "error"]
 
         # one -i per real clip; gaps are synthesized inside filter_complex.
@@ -194,6 +196,7 @@ class ExportWorker(QObject):
             segments, clip_inputs, add_track_indices,
             tgt_w=tgt_w, tgt_h=tgt_h,
             is_audio_only=is_audio_only, needs_audio=needs_audio,
+            acodec=spec.get("acodec"),
         )
         cmd += ["-filter_complex", filter_complex]
 
@@ -232,11 +235,19 @@ class ExportWorker(QObject):
         add_track_indices: list[int],
         *, tgt_w: int, tgt_h: int,
         is_audio_only: bool, needs_audio: bool,
+        acodec: str | None = None,
     ) -> tuple[str, str, str | None]:
         job = self._job
         parts: list[str] = []
         v_labels: list[str] = []
         a_labels: list[str] = []
+        # libmp3lame works best with 44100 Hz fltp; force that in silence sources.
+        if acodec == "libmp3lame":
+            _null_sr = 44100
+            _null_aformat = ",aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+        else:
+            _null_sr = 48000
+            _null_aformat = ""
 
         for i, (kind, seg_start, seg_end, clip) in enumerate(segments):
             seg_dur = max(0.01, seg_end - seg_start)
@@ -289,8 +300,9 @@ class ExportWorker(QObject):
                         parts.append(f"[{inp}:a]" + ",".join(achain) + f"[a{i}]")
                     else:
                         parts.append(
-                            f"anullsrc=channel_layout=stereo:sample_rate=48000,"
-                            f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS[a{i}]"
+                            f"anullsrc=channel_layout=stereo:sample_rate={_null_sr},"
+                            f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS"
+                            f"{_null_aformat}[a{i}]"
                         )
                     a_labels.append(f"a{i}")
             else:  # gap
@@ -302,8 +314,9 @@ class ExportWorker(QObject):
                     v_labels.append(f"v{i}")
                 if needs_audio:
                     parts.append(
-                        f"anullsrc=channel_layout=stereo:sample_rate=48000,"
-                        f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS[a{i}]"
+                        f"anullsrc=channel_layout=stereo:sample_rate={_null_sr},"
+                        f"atrim=duration={seg_dur:.3f},asetpts=PTS-STARTPTS"
+                        f"{_null_aformat}[a{i}]"
                     )
                     a_labels.append(f"a{i}")
 
@@ -324,8 +337,11 @@ class ExportWorker(QObject):
                     raise RuntimeError(
                         f"internal export error: expected {n} audio labels, got {len(a_labels)}"
                     )
+                # Concat expects inputs interleaved per segment: v0,a0,v1,a1,...
+                # NOT all-video-then-all-audio (which causes type-mismatch errors).
+                interleaved = [lbl for pair in zip(v_labels, a_labels) for lbl in pair]
                 parts.append(
-                    f"{_join_filter_labels(v_labels)}{_join_filter_labels(a_labels)}"
+                    f"{_join_filter_labels(interleaved)}"
                     f"concat=n={n}:v=1:a=1[vc][ac]"
                 )
                 v_out, a_out = "vc", "ac"
@@ -420,11 +436,26 @@ class ExportWorker(QObject):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             bufsize=1,
             **_POPEN_KWARGS,
         )
         assert self._proc.stdout is not None
+        assert self._proc.stderr is not None
+
+        stderr_lines: collections.deque[str] = collections.deque(maxlen=200)
+
+        def _drain_stderr() -> None:
+            for line in self._proc.stderr:
+                line = line.rstrip()
+                if line:
+                    stderr_lines.append(line)
+                    self.log.emit(line)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         for line in self._proc.stdout:
             if self._cancelled:
                 self._proc.terminate()
@@ -441,10 +472,12 @@ class ExportWorker(QObject):
             elif key == "progress" and value == "end":
                 self.progress.emit(100)
                 break
+
         rc = self._proc.wait()
+        stderr_thread.join(timeout=5)
         if rc != 0 and not self._cancelled:
-            err = self._proc.stderr.read() if self._proc.stderr else ""
-            raise RuntimeError(f"ffmpeg exited {rc}: {err.strip()[-400:]}")
+            err = "\n".join(stderr_lines).strip()
+            raise RuntimeError(f"ffmpeg exited {rc}: {err[-600:]}")
 
     def _update_eta(self, overall_pct: float) -> None:
         if overall_pct < 2.0:
