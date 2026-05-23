@@ -1725,6 +1725,7 @@ class MainWindow(QMainWindow):
                 or abs(c.src_start - vals["src_start"]) > 1e-4
                 or abs(c.src_end - vals["src_end"]) > 1e-4
                 or c.muted != vals["muted"]
+                or abs(c.audio_volume - vals["audio_volume"]) > 1e-6
             )
             if not changed:
                 return
@@ -1733,6 +1734,7 @@ class MainWindow(QMainWindow):
             c.src_start = vals["src_start"]
             c.src_end = vals["src_end"]
             c.muted = vals["muted"]
+            c.audio_volume = vals["audio_volume"]
             self.timeline.set_clips(self._clips)
             self._update_range_label()
             self._update_audio_volumes()
@@ -2061,9 +2063,10 @@ class MainWindow(QMainWindow):
             and not clip.linked_audio
         )
         has_added = bool(self._added_audios)
-        default_clip_vol = 0.0 if clip_muted else 0.7
+        clip_gain = clip.audio_volume if clip is not None else 1.0
+        default_clip_vol = 0.0 if clip_muted else max(0.0, min(1.0, 0.7 * clip_gain))
         added_gain = max(0.0, min(1.0, self.audio_gain.value()))
-        orig_vol = max(0.0, min(1.0, self.orig_gain.value()))
+        orig_vol = max(0.0, min(1.0, self.orig_gain.value() * clip_gain))
 
         if not has_added:
             if unlinked:
@@ -2946,6 +2949,14 @@ class ClipPropertiesDialog(QDialog):
         self.muted.setChecked(clip.muted)
         form.addRow("", self.muted)
 
+        self.audio_volume = QSpinBox()
+        self.audio_volume.setRange(0, 200)
+        self.audio_volume.setSingleStep(5)
+        self.audio_volume.setSuffix("%")
+        self.audio_volume.setValue(int(round(clip.audio_volume * 100)))
+        self.audio_volume.setEnabled(clip.asset.has_audio)
+        form.addRow("Volume", self.audio_volume)
+
         lay.addLayout(form)
 
         row = QHBoxLayout()
@@ -2974,6 +2985,7 @@ class ClipPropertiesDialog(QDialog):
             "src_start": s,
             "src_end": e,
             "muted": self.muted.isChecked(),
+            "audio_volume": self.audio_volume.value() / 100.0,
         }
         super().accept()
 

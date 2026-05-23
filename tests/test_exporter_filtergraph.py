@@ -103,6 +103,82 @@ class ExporterFiltergraphTests(unittest.TestCase):
         )
         self.assertIn("sample_rate=44100", graph)
 
+    def test_default_clip_volume_does_not_add_filter(self) -> None:
+        clip = Clip(_asset("v.mp4", has_audio=True), timeline_start=0.0)
+        job = ExportJob(clips=[clip], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("clip", 0.0, 1.0, clip)],
+            {clip.id: 0},
+            [],
+            tgt_w=1280,
+            tgt_h=720,
+            is_audio_only=False,
+            needs_audio=True,
+        )
+
+        self.assertNotIn("volume=", graph)
+        self.assertIn("[0:a]atrim=start=0.000:end=1.000,asetpts=PTS-STARTPTS[a0]", graph)
+
+    def test_clip_volume_adds_ffmpeg_volume_filter(self) -> None:
+        clip = Clip(_asset("v.mp4", has_audio=True), timeline_start=0.0)
+        clip.audio_volume = 1.5
+        job = ExportJob(clips=[clip], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("clip", 0.0, 1.0, clip)],
+            {clip.id: 0},
+            [],
+            tgt_w=1280,
+            tgt_h=720,
+            is_audio_only=False,
+            needs_audio=True,
+        )
+
+        self.assertIn(
+            "[0:a]atrim=start=0.000:end=1.000,asetpts=PTS-STARTPTS,volume=1.500[a0]",
+            graph,
+        )
+
+    def test_zero_clip_volume_exports_silence_filter(self) -> None:
+        clip = Clip(_asset("v.mp4", has_audio=True), timeline_start=0.0)
+        clip.audio_volume = 0.0
+        job = ExportJob(clips=[clip], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, _ = worker._build_filtergraph(
+            [("clip", 0.0, 1.0, clip)],
+            {clip.id: 0},
+            [],
+            tgt_w=1280,
+            tgt_h=720,
+            is_audio_only=False,
+            needs_audio=True,
+        )
+
+        self.assertIn("volume=0.000[a0]", graph)
+
+    def test_no_audio_clip_uses_generated_silence_for_export_audio(self) -> None:
+        clip = Clip(_asset("silent.mp4", has_audio=False), timeline_start=0.0)
+        job = ExportJob(clips=[clip], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)")
+        worker = ExportWorker(job)
+
+        graph, _, a_label = worker._build_filtergraph(
+            [("clip", 0.0, 1.0, clip)],
+            {clip.id: 0},
+            [],
+            tgt_w=1280,
+            tgt_h=720,
+            is_audio_only=False,
+            needs_audio=True,
+        )
+
+        self.assertEqual(a_label, "ac")
+        self.assertNotIn("[0:a]", graph)
+        self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", graph)
+
 
 if __name__ == "__main__":
     unittest.main()

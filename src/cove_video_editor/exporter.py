@@ -297,6 +297,9 @@ class ExportWorker(QObject):
                                   "asetpts=PTS-STARTPTS"]
                         if abs(c.speed - 1.0) > 1e-6:
                             achain.append(f"atempo={_atempo_chain(c.speed)}")
+                        volume = max(0.0, min(2.0, c.audio_volume))
+                        if abs(volume - 1.0) > 1e-6:
+                            achain.append(f"volume={volume:.3f}")
                         parts.append(f"[{inp}:a]" + ",".join(achain) + f"[a{i}]")
                     else:
                         parts.append(

@@ -189,6 +189,7 @@ class Clip:
     src_end: float = 0.0
     speed: float = 1.0
     muted: bool = False
+    audio_volume: float = 1.0
     linked_audio: bool = True
     audio_offset: float = 0.0
     # True when the user deleted the clip's audio track; the video stays on
@@ -225,7 +226,8 @@ class Clip:
         c = Clip(
             asset=self.asset, timeline_start=self.timeline_start,
             src_start=self.src_start, src_end=self.src_end, speed=self.speed,
-            muted=self.muted, linked_audio=self.linked_audio,
+            muted=self.muted, audio_volume=self.audio_volume,
+            linked_audio=self.linked_audio,
             audio_offset=self.audio_offset, audio_removed=self.audio_removed,
         )
         c.thumbs = list(self.thumbs)
