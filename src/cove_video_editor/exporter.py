@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -87,29 +86,25 @@ class ExportWorker(QObject):
 
     def run(self) -> None:
         self._started_wall = time.monotonic()
-        try:
-            cmd = self._build_command()
-        except Exception as exc:  # noqa: BLE001
-            self._cleanup_tmp()
-            self.failed.emit(str(exc))
-            return
-        self.log.emit("$ " + " ".join(cmd))
-        try:
-            self._execute(cmd)
-        except Exception as exc:  # noqa: BLE001
-            self._cleanup_tmp()
-            self.failed.emit(str(exc))
-            return
-        self._cleanup_tmp()
+        with tempfile.TemporaryDirectory(prefix="cove-subs-") as _tmp:
+            self._tmp_dir = Path(_tmp)
+            try:
+                cmd = self._build_command()
+            except Exception as exc:  # noqa: BLE001
+                self.failed.emit(str(exc))
+                return
+            self.log.emit("$ " + " ".join(cmd))
+            try:
+                self._execute(cmd)
+            except Exception as exc:  # noqa: BLE001
+                self.failed.emit(str(exc))
+                return
+            finally:
+                self._tmp_dir = None
         if self._cancelled:
             self.failed.emit("Cancelled")
             return
         self.finished.emit(self._job.output)
-
-    def _cleanup_tmp(self) -> None:
-        if self._tmp_dir is not None and self._tmp_dir.exists():
-            shutil.rmtree(self._tmp_dir, ignore_errors=True)
-            self._tmp_dir = None
 
     def _resolve_subtitle_path(self, sub: SubtitleTrack, tgt_w: int, tgt_h: int) -> Path:
         """Return the path ffmpeg's ``subtitles=`` filter should load.
@@ -125,8 +120,7 @@ class ExportWorker(QObject):
         Cues are written with the user's sync offset already applied so
         the live preview, sync dialog, and burn-in all stay in lockstep.
         """
-        if self._tmp_dir is None:
-            self._tmp_dir = Path(tempfile.mkdtemp(prefix="cove-subs-"))
+        assert self._tmp_dir is not None, "_resolve_subtitle_path called outside run()"
         out = self._tmp_dir / f"{sub.id}.ass"
         out.write_text(_render_ass(sub, tgt_w, tgt_h), encoding="utf-8")
         return out

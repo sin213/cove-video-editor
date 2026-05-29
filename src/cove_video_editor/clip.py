@@ -7,7 +7,7 @@ from pathlib import Path
 from PySide6.QtGui import QImage, QPixmap
 
 
-@dataclass
+@dataclass(slots=True)
 class AddedAudio:
     """One audio file placed on one of the audio tracks.
 
@@ -37,7 +37,7 @@ class AddedAudio:
         return a
 
 
-@dataclass
+@dataclass(slots=True)
 class MediaAsset:
     """A file in the clip bin. Independent of any timeline placement.
 
@@ -67,7 +67,7 @@ DEFAULT_IMAGE_DURATION = 5.0
 IMAGE_ASSET_DURATION_CAP = 600.0
 
 
-@dataclass
+@dataclass(slots=True)
 class SubtitleTrack:
     """Burn-in subtitle entry — a user-supplied SRT/VTT file plus the style
     applied when the exporter invokes ffmpeg's ``subtitles=`` filter.
@@ -174,7 +174,7 @@ def _parse_sub_ts(s: str) -> float:
     return int(h) * 3600 + int(mm) * 60 + int(ss) + ms / 1000.0
 
 
-@dataclass
+@dataclass(slots=True)
 class Clip:
     """One clip placed on the timeline.
 

@@ -13,3 +13,10 @@ cove_icon.ico
 # Local workflow notes
 RELEASES.md
 WORKFLOW.md
+AGENTS.md
+.claudeignore
+
+.codex-reviews/
+
+# Session aids (orientation snapshots)
+*-orientation.md

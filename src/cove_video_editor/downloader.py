@@ -24,6 +24,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+_PROGRESS_RE = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
+_QUOTED_MP4_RE = re.compile(r'"([^"]+\.mp4)"')
+
 
 def _quality_format(max_height: int | None = None) -> str:
     height = f"[height<={max_height}]" if max_height is not None else ""
@@ -222,7 +225,7 @@ class DownloadWorker(QObject):
 
     @staticmethod
     def _progress_percent(line: str) -> int | None:
-        match = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", line)
+        match = _PROGRESS_RE.search(line)
         if not match:
             return None
         return max(0, min(100, int(float(match.group(1)))))
@@ -269,7 +272,7 @@ class DownloadWorker(QObject):
         candidate = Path(line.strip('"'))
         if candidate.suffix.lower() == ".mp4" and candidate.exists():
             return candidate
-        quoted = re.search(r'"([^"]+\.mp4)"', line)
+        quoted = _QUOTED_MP4_RE.search(line)
         if quoted:
             candidate = Path(quoted.group(1))
             if candidate.exists():

@@ -13,13 +13,13 @@ artifacts via GitHub Actions.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v2.1.3-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v2.2.0-5eead4?style=flat-square)
 
-![Cove Video Editor v2.1.3](docs/screenshot.png)
+![Cove Video Editor v2.2.0](docs/screenshot.png)
 
 ---
 
-## What's new in v2.1.3
+## What's new in v2.2.0
 
 - **Per-clip volume control** — the clip properties dialog (double-click any
   clip on the timeline) now has a "Volume" field, 0–200% in 5% steps.
@@ -30,7 +30,7 @@ artifacts via GitHub Actions.
   volume mixes into the original-track gain control for live monitoring
   so the preview matches what the exporter writes.
 
-## What's new in v2.1.3
+## What's new in v2.2.0
 
 - **Collapsible export log** — a "Details ▸" toggle next to the export
   controls reveals the full ffmpeg command, live progress lines, and any
@@ -324,13 +324,13 @@ Both Linux scripts download ffmpeg automatically.
 ### Linux — AppImage + .deb
 
 ```bash
-VERSION=2.1.3 bash scripts/build-release.sh
+VERSION=2.2.0 bash scripts/build-release.sh
 # Output in release/:
-#   Cove-Video-Editor-2.1.3-x86_64.AppImage
-#   cove-video-editor_2.1.3_amd64.deb
+#   Cove-Video-Editor-2.2.0-x86_64.AppImage
+#   cove-video-editor_2.2.0_amd64.deb
 ```
 
-`SKIP_DEB=1 VERSION=2.1.3 bash scripts/build-release.sh` builds just the
+`SKIP_DEB=1 VERSION=2.2.0 bash scripts/build-release.sh` builds just the
 AppImage.
 
 ### Windows — Setup.exe + Portable.exe (native)
@@ -339,10 +339,10 @@ Requires [Inno Setup 6](https://jrsoftware.org/isdl.php) (pre-installed on
 GitHub Actions' `windows-latest`).
 
 ```powershell
-.\build.ps1 -Version 2.1.3
+.\build.ps1 -Version 2.2.0
 # Output in release\:
-#   cove-video-editor-2.1.3-Setup.exe
-#   cove-video-editor-2.1.3-Portable.exe
+#   cove-video-editor-2.2.0-Setup.exe
+#   cove-video-editor-2.2.0-Portable.exe
 ```
 
 ### Windows — Setup.exe + Portable.exe (from Linux, via Wine)
@@ -352,15 +352,15 @@ prefix on first run: Python 3.12 for Windows, PySide6, Pillow, PyInstaller,
 and Inno Setup 6. Subsequent runs reuse the prefix.
 
 ```bash
-VERSION=2.1.3 bash scripts/build-windows-wine.sh
+VERSION=2.2.0 bash scripts/build-windows-wine.sh
 # Output in release/:
-#   cove-video-editor-2.1.3-Setup.exe
-#   cove-video-editor-2.1.3-Portable.exe
+#   cove-video-editor-2.2.0-Setup.exe
+#   cove-video-editor-2.2.0-Portable.exe
 ```
 
 ### Automated release via GitHub Actions
 
-Push a tag matching `v*` (e.g. `v2.1.3`) and `.github/workflows/release.yml`
+Push a tag matching `v*` (e.g. `v2.2.0`) and `.github/workflows/release.yml`
 runs the Linux + Windows jobs in parallel and attaches all four artifacts to
 the GitHub Release created for the tag.
 
