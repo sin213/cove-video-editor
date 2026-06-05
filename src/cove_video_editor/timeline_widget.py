@@ -64,7 +64,7 @@ CHAIN_BTN_MARGIN = 4
 
 @dataclass
 class _Drag:
-    mode: str = ""                    # "seek", "select", "move_clip", "trim_l", "trim_r", "move_audio", "resize_tracks"
+    mode: str = ""                    # "seek", "select", "move_clip", "trim_l", "trim_r", "move_audio", "resize_tracks", "trim_added_l", "trim_added_r"
     clip_id: str = ""
     grab_offset_s: float = 0.0        # clip drag: t_clip_start at grab time
     original_clip_start: float = 0.0
@@ -92,6 +92,7 @@ class TimelineWidget(QWidget):
     addedAudioReplaceToggled = Signal(bool)
     addedAudioOffsetChanged = Signal(str, float)          # audio id, offset
     addedAudioDeleteRequested = Signal(str)               # audio id ("" → clear all)
+    addedAudioRangeChanged = Signal(str)                  # audio id — src_start/src_end edited
     clipDoubleClicked = Signal(str)               # clip id
     audioLinkToggled = Signal(str)                # clip id
     clipDeleteRequested = Signal(str)             # clip id
@@ -286,7 +287,7 @@ class TimelineWidget(QWidget):
 
     def _total_length(self) -> float:
         added_end = max(
-            (a.offset + a.duration for a in self._added_audios),
+            (a.timeline_end for a in self._added_audios),
             default=0.0,
         )
         return max(
@@ -653,18 +654,27 @@ class TimelineWidget(QWidget):
             if audio.peaks and audio.rate > 0:
                 self._draw_added_audio_chunk(
                     p, audio.peaks, audio.rate,
-                    tile, tile_vis, audio.duration, theme.C_WARN,
+                    tile, tile_vis, audio.src_span, theme.C_WARN,
+                    src_start=audio.src_start,
                 )
             selected = audio.id == self._added_audio_selected_id
             if selected:
                 pen = QPen(theme.C_WARN)
                 pen.setWidth(2)
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(tile_vis.adjusted(0, 0, -1, -1))
+                hw = HANDLE_W
+                handle_color = QColor(theme.C_WARN)
+                handle_color.setAlpha(100)
+                p.fillRect(QRect(tile_vis.left(), tile_vis.top(), hw, tile_vis.height()), handle_color)
+                p.fillRect(QRect(tile_vis.right() - hw, tile_vis.top(), hw, tile_vis.height()), handle_color)
             else:
                 pen = QPen(theme.C_AUDIO_CLIP_BD)
                 pen.setWidth(1)
-            p.setPen(pen)
-            p.setBrush(Qt.NoBrush)
-            p.drawRect(tile_vis.adjusted(0, 0, -1, -1))
+                p.setPen(pen)
+                p.setBrush(Qt.NoBrush)
+                p.drawRect(tile_vis.adjusted(0, 0, -1, -1))
 
     def _draw_clip_waveform(
         self, p: QPainter, c: Clip, r: QRect, r_vis: QRect, color: QColor,
@@ -741,10 +751,11 @@ class TimelineWidget(QWidget):
     def _draw_added_audio_chunk(
         self, p: QPainter, peaks: list[float], rate: int,
         chunk: QRect, chunk_vis: QRect, chunk_seconds: float,
-        color: QColor,
+        color: QColor, *, src_start: float = 0.0,
     ) -> None:
         """Draw one loop iteration of the added audio. The chunk's left edge
-        maps to source second 0; its right edge to `chunk_seconds`."""
+        maps to source second `src_start`; its right edge to
+        `src_start + chunk_seconds`."""
         n = len(peaks)
         if n == 0 or rate <= 0 or chunk.width() <= 0 or chunk_seconds <= 0:
             return
@@ -760,8 +771,8 @@ class TimelineWidget(QWidget):
         top_pts: list[QPointF] = []
         bot_pts: list[QPointF] = []
         for x in range(chunk_vis.left(), chunk_vis.right() + 1):
-            audio_t = (x - chunk.left()) / pps
-            if audio_t < 0 or audio_t > chunk_seconds:
+            audio_t = src_start + (x - chunk.left()) / pps
+            if audio_t < src_start or audio_t > src_start + chunk_seconds:
                 continue
             if interp:
                 raw_idx = audio_t * rate
@@ -815,7 +826,7 @@ class TimelineWidget(QWidget):
         lane = max(0, min(len(self._audio_lane_heights) - 1, audio.lane))
         lane_rect = self._audio_lane_rect(lane)
         x0 = self._time_to_x(audio.offset)
-        x1 = self._time_to_x(audio.offset + max(0.01, audio.duration))
+        x1 = self._time_to_x(audio.offset + max(0.01, audio.timeline_length))
         return QRect(x0, lane_rect.top(), max(2, x1 - x0), lane_rect.height())
 
     def _hit_added_audio(self, pos: QPoint, lane: int | None = None) -> AddedAudio | None:
@@ -886,6 +897,17 @@ class TimelineWidget(QWidget):
                 continue
             if self._is_over_playhead(pos):
                 return _Drag(mode="playhead_region")
+            sel_audio = next(
+                (a for a in self._added_audios
+                 if a.id == self._added_audio_selected_id and a.lane == lane),
+                None,
+            )
+            if sel_audio is not None:
+                ar = self._added_audio_tile_rect(sel_audio)
+                if abs(pos.x() - ar.left()) <= HANDLE_W:
+                    return _Drag(mode="trim_added_l", clip_id=sel_audio.id)
+                if abs(pos.x() - ar.right()) <= HANDLE_W:
+                    return _Drag(mode="trim_added_r", clip_id=sel_audio.id)
             hit_audio = self._hit_added_audio(pos, lane=lane)
             if hit_audio is not None:
                 return _Drag(mode="select_added", clip_id=hit_audio.id)
@@ -973,7 +995,7 @@ class TimelineWidget(QWidget):
             self._added_audio_selected_id = audio.id
             if self._selected_id:
                 self._selected_id = ""
-                self.clipSelected.emit("")
+            self.clipSelected.emit("")
             self.clear_selection()
             self._drag = _Drag(
                 mode="move_added",
@@ -991,6 +1013,9 @@ class TimelineWidget(QWidget):
             )
             return
         if hit.mode in ("trim_l", "trim_r"):
+            self._drag = hit
+            return
+        if hit.mode in ("trim_added_l", "trim_added_r"):
             self._drag = hit
             return
         if hit.mode == "move_audio":
@@ -1052,6 +1077,7 @@ class TimelineWidget(QWidget):
                 "seek": Qt.PointingHandCursor,
                 "select": Qt.IBeamCursor,
                 "trim_l": Qt.SplitHCursor, "trim_r": Qt.SplitHCursor,
+                "trim_added_l": Qt.SplitHCursor, "trim_added_r": Qt.SplitHCursor,
                 "move_clip": Qt.SizeAllCursor,
                 "move_audio": Qt.SizeHorCursor,
                 "playhead_region": Qt.SizeHorCursor,
@@ -1075,6 +1101,8 @@ class TimelineWidget(QWidget):
             self.update()
         elif self._drag.mode in ("trim_l", "trim_r"):
             self._apply_trim(self._drag.mode, t)
+        elif self._drag.mode in ("trim_added_l", "trim_added_r"):
+            self._apply_added_audio_trim(self._drag.mode, t)
         elif self._drag.mode == "move_clip":
             if self._drag.moved:
                 new_start = max(0.0, t - self._drag.grab_offset_s)
@@ -1108,7 +1136,7 @@ class TimelineWidget(QWidget):
                 if audio is not None:
                     new_offset = max(0.0, t - self._drag.grab_offset_s)
                     audio.offset = self._snap_audio_start(
-                        new_offset, audio.duration, ignore_audio_id=audio.id,
+                        new_offset, audio.timeline_length, ignore_audio_id=audio.id,
                     )
                     # Vertical drag switches between Audio Track 1 and 2.
                     new_lane = self._lane_for_y(pos.y())
@@ -1135,6 +1163,13 @@ class TimelineWidget(QWidget):
             c = self._find(self._drag.clip_id)
             if c is not None:
                 self.rangeChanged.emit(c.id, c.src_start, c.src_end)
+        elif mode in ("trim_added_l", "trim_added_r"):
+            audio = next(
+                (a for a in self._added_audios if a.id == self._drag.clip_id),
+                None,
+            )
+            if audio is not None:
+                self.addedAudioRangeChanged.emit(audio.id)
         elif mode == "move_clip":
             c = self._find(self._drag.clip_id)
             if c is not None and self._drag.moved:
@@ -1237,6 +1272,30 @@ class TimelineWidget(QWidget):
             c.src_end = max(c.src_start + min_gap, min(c.asset.duration, new_src_end))
         self.update()
 
+    def _apply_added_audio_trim(self, mode: str, t_timeline: float) -> None:
+        audio = next(
+            (a for a in self._added_audios if a.id == self._drag.clip_id),
+            None,
+        )
+        if audio is None:
+            return
+        min_gap = max(0.05, audio.duration * 0.005)
+        if mode == "trim_added_l":
+            anchor_end_t = audio.timeline_end
+            new_src = audio.src_start + (t_timeline - audio.offset)
+            new_src = max(0.0, min(new_src, audio.src_end - min_gap))
+            audio.src_start = new_src
+            new_offset = anchor_end_t - audio.timeline_length
+            if new_offset < 0.0:
+                audio.src_start = audio.src_end - anchor_end_t
+                audio.src_start = max(0.0, audio.src_start)
+                new_offset = 0.0
+            audio.offset = new_offset
+        else:
+            new_src_end = audio.src_start + (t_timeline - audio.offset)
+            audio.src_end = max(audio.src_start + min_gap, min(audio.duration, new_src_end))
+        self.update()
+
     def _snap_clip_start(self, moved: Clip, new_start: float) -> float:
         """Snap moved clip's start/end to other clip edges, t=0, and the
         playhead within 10px."""
@@ -1277,7 +1336,7 @@ class TimelineWidget(QWidget):
             if a.id == ignore_audio_id:
                 continue
             candidates.append(a.offset)
-            candidates.append(a.offset + a.duration)
+            candidates.append(a.timeline_end)
         return candidates
 
     def _snap_to_candidates(

@@ -34,6 +34,7 @@ class AudioTrack:
     original_volume: float = 1.0
     offset: float = 0.0          # timeline seconds where the track starts
     duration: float = 0.0        # natural length; 0 means "use full input"
+    src_start: float = 0.0       # source-file start in seconds (trim)
 
 
 @dataclass
@@ -371,9 +372,12 @@ class ExportWorker(QObject):
                     f"adelay={pre_ms}:all=1," if pre_ms > 0 else ""
                 )
                 label = f"extra_a{i}"
+                trim_start = max(0.0, track.src_start)
+                trim_end = trim_start + play_dur
                 parts.append(
                     f"[{track_idx}:a]"
-                    f"atrim=duration={play_dur:.3f},asetpts=PTS-STARTPTS,"
+                    f"atrim=start={trim_start:.3f}:end={trim_end:.3f},"
+                    f"asetpts=PTS-STARTPTS,"
                     f"{delay_stage}"
                     f"apad=whole_dur={total:.3f},"
                     f"volume={track.volume:.3f}[{label}]"

@@ -93,6 +93,7 @@ from .clip import (
     parse_sub_cues,
     sequence_length,
     sort_clips,
+    split_added_audio,
     split_clip,
 )
 from .clip_bin import ASSET_MIME, ClipBin
@@ -754,6 +755,7 @@ class MainWindow(QMainWindow):
         self._play_timer.setInterval(30)
         self._play_timer.timeout.connect(self._on_play_tick)
         self._play_last_wall: float = 0.0
+        self._play_region: tuple[float, float] | None = None
 
         # Throttle scrub seeks so rapid dragging doesn't queue up decoder
         # work faster than it can keep up. `_flush_pending_seek` guarantees
@@ -889,6 +891,7 @@ class MainWindow(QMainWindow):
         self.timeline.addedAudioDeleteRequested.connect(self._on_added_audio_delete_requested)
         self.timeline.addedAudioReplaceToggled.connect(self._on_added_audio_replace_toggled)
         self.timeline.addedAudioOffsetChanged.connect(self._on_added_audio_offset_changed)
+        self.timeline.addedAudioRangeChanged.connect(self._on_added_audio_range_changed)
         self.timeline.clipDoubleClicked.connect(self._open_clip_properties)
         self.timeline.audioLinkToggled.connect(self._on_audio_link_toggled)
         self.timeline.clipDeleteRequested.connect(self._on_clip_delete_requested)
@@ -1699,6 +1702,7 @@ class MainWindow(QMainWindow):
             self._set_preview_clip(c)
         self._sync_selected_clip_ui()
         self._update_audio_volumes()
+        self._update_controls_enabled()
 
     def _on_clip_range_changed(self, _id: str, _s: float, _e: float) -> None:
         self._snapshot()
@@ -1741,25 +1745,92 @@ class MainWindow(QMainWindow):
 
     def _split_at_playhead(self) -> None:
         t = self.timeline.playhead()
+        # If an added-audio clip is selected, split that first.
+        sel_audio_id = self.timeline._added_audio_selected_id
+        if sel_audio_id:
+            audio = next((a for a in self._added_audios if a.id == sel_audio_id), None)
+            if audio is not None and audio.offset <= t < audio.timeline_end:
+                self._split_added_audio_at(audio, t)
+                return
         c = clip_at_timeline(self._clips, t)
-        if c is None:
-            self.status.showMessage("Playhead isn't over a clip.", 3000)
+        if c is not None:
+            self._snapshot()
+            new = split_clip(c, t)
+            if new is None:
+                self._undo_stack.pop()
+                self.status.showMessage("Playhead is too close to a clip edge.", 3000)
+                return
+            self._clips.append(new)
+            self._clips = sort_clips(self._clips)
+            self.timeline.set_clips(self._clips)
+            self.timeline.select_clip(new.id)
+            self._sync_selected_clip_ui()
+            self._drive_main_player_from_playhead()
             return
+        # No video clip — try any added-audio under the playhead.
+        audio = next(
+            (a for a in self._added_audios if a.offset <= t < a.timeline_end),
+            None,
+        )
+        if audio is not None:
+            self._split_added_audio_at(audio, t)
+            return
+        self.status.showMessage("Playhead isn't over a clip.", 3000)
+
+    def _split_added_audio_at(self, audio: AddedAudio, t: float) -> None:
         self._snapshot()
-        new = split_clip(c, t)
+        new = split_added_audio(audio, t)
         if new is None:
-            # Roll back the snapshot because we didn't actually mutate.
             self._undo_stack.pop()
-            self.status.showMessage("Playhead is too close to a clip edge.", 3000)
+            self.status.showMessage("Playhead is too close to an audio clip edge.", 3000)
             return
-        self._clips.append(new)
-        self._clips = sort_clips(self._clips)
-        self.timeline.set_clips(self._clips)
-        self.timeline.select_clip(new.id)
-        self._sync_selected_clip_ui()
-        # Keep the preview on the correct frame at the playhead, not on
-        # stale video from before the split.
-        self._drive_main_player_from_playhead()
+        new.peaks = audio.peaks
+        new.rate = audio.rate
+        self._added_audios.append(new)
+        self._create_added_player(new)
+        self._refresh_added_audio_display()
+        self._sync_added_audio_playback()
+        self._update_controls_enabled()
+
+    def _merge_added_audio(self, audio: AddedAudio) -> None:
+        same_file = sorted(
+            [a for a in self._added_audios
+             if a.path == audio.path and a.lane == audio.lane],
+            key=lambda a: a.offset,
+        )
+        idx = next((i for i, a in enumerate(same_file) if a.id == audio.id), -1)
+        if idx < 0:
+            return
+        merged = False
+        # Try merge with next neighbour first.
+        if idx + 1 < len(same_file):
+            nxt = same_file[idx + 1]
+            if (abs(audio.src_end - nxt.src_start) < 0.05
+                    and abs(audio.timeline_end - nxt.offset) < 0.05):
+                self._snapshot()
+                audio.src_end = nxt.src_end
+                self._destroy_added_player(nxt.id)
+                self._added_audios = [a for a in self._added_audios if a.id != nxt.id]
+                merged = True
+        # If not merged with next, try previous.
+        if not merged and idx - 1 >= 0:
+            prev = same_file[idx - 1]
+            if (abs(prev.src_end - audio.src_start) < 0.05
+                    and abs(prev.timeline_end - audio.offset) < 0.05):
+                self._snapshot()
+                prev.src_end = audio.src_end
+                self._destroy_added_player(audio.id)
+                self._added_audios = [a for a in self._added_audios if a.id != audio.id]
+                merged = True
+        if merged:
+            self._refresh_added_audio_display()
+            self._sync_added_audio_playback()
+            self._update_controls_enabled()
+            self.status.showMessage("Audio clips merged.", 2500)
+        else:
+            self.status.showMessage(
+                "No adjacent audio clip from the same source to merge with.", 3500,
+            )
 
     def _merge_with_next_clip(self) -> None:
         """Inverse of split — merge the selected clip with the next one
@@ -1774,7 +1845,17 @@ class MainWindow(QMainWindow):
     def _on_merge_button_clicked(self) -> None:
         """Merge-button entry point that lets the user pick a direction when
         both neighbours are mergeable instead of silently picking 'next'."""
-        c = self._selected_clip() or clip_at_timeline(self._clips, self.timeline.playhead())
+        # Selected audio takes priority over video-at-playhead.
+        sel_audio_id = self.timeline._added_audio_selected_id
+        if sel_audio_id:
+            audio = next((a for a in self._added_audios if a.id == sel_audio_id), None)
+            if audio is not None:
+                self._merge_added_audio(audio)
+                return
+        c = self._selected_clip() or (
+            clip_at_timeline(self._clips, self.timeline.playhead())
+            if self._clips else None
+        )
         if c is None:
             self.status.showMessage("Select a clip to merge.", 3000)
             return
@@ -1851,9 +1932,14 @@ class MainWindow(QMainWindow):
 
     def _delete_selected_clip(self) -> None:
         c = self._selected_clip()
-        if not c:
+        if c:
+            self._delete_clip_by_id(c.id)
             return
-        self._delete_clip_by_id(c.id)
+        sel_audio_id = self.timeline._added_audio_selected_id
+        if sel_audio_id:
+            self.timeline._added_audio_selected_id = ""
+            self._remove_added_audio(sel_audio_id)
+            return
 
     def _on_clip_delete_requested(self, clip_id: str) -> None:
         self._delete_clip_by_id(clip_id)
@@ -1921,7 +2007,9 @@ class MainWindow(QMainWindow):
     def _on_region_delete(self, start: float, end: float) -> None:
         self._snapshot()
         self._clips = delete_region(self._clips, start, end)
+        self._delete_added_audio_region(start, end)
         self.timeline.set_clips(self._clips)
+        self._refresh_added_audio_display()
         self.timeline.clear_selection()
         self._sync_selected_clip_ui()
         self._update_range_label()
@@ -1931,11 +2019,62 @@ class MainWindow(QMainWindow):
     def _on_region_crop(self, start: float, end: float) -> None:
         self._snapshot()
         self._clips = keep_only_region(self._clips, start, end)
+        self._crop_added_audio_to_region(start, end)
         self.timeline.set_clips(self._clips)
+        self._refresh_added_audio_display()
         self.timeline.clear_selection()
         self._sync_selected_clip_ui()
         self._update_range_label()
         self.timeline.set_playhead(0.0)
+
+    def _delete_added_audio_region(self, start: float, end: float) -> None:
+        if end <= start:
+            return
+        dur = end - start
+        kept: list[AddedAudio] = []
+        for a in self._added_audios:
+            ae = a.timeline_end
+            if ae <= start:
+                kept.append(a)
+            elif a.offset >= end:
+                a.offset -= dur
+                kept.append(a)
+            elif a.offset >= start and ae <= end:
+                self._destroy_added_player(a.id)
+            elif a.offset < start and ae > end:
+                right = a.clone()
+                right.id = __import__("uuid").uuid4().hex[:8]
+                right.src_start = a.src_for_timeline(end)
+                a.src_end = a.src_for_timeline(start)
+                right.offset = start
+                kept.append(a)
+                kept.append(right)
+                self._create_added_player(right)
+            elif a.offset < start:
+                a.src_end = a.src_for_timeline(start)
+                kept.append(a)
+            else:
+                a.src_start = a.src_for_timeline(end)
+                a.offset = start
+                kept.append(a)
+        self._added_audios = kept
+
+    def _crop_added_audio_to_region(self, start: float, end: float) -> None:
+        if end <= start:
+            return
+        kept: list[AddedAudio] = []
+        for a in self._added_audios:
+            ae = a.timeline_end
+            if ae <= start or a.offset >= end:
+                self._destroy_added_player(a.id)
+                continue
+            new_src_start = a.src_for_timeline(start) if a.offset < start else a.src_start
+            new_src_end = a.src_for_timeline(end) if ae > end else a.src_end
+            a.src_start = new_src_start
+            a.src_end = new_src_end
+            a.offset = max(0.0, a.offset - start)
+            kept.append(a)
+        self._added_audios = kept
 
     def _on_region_export(self, start: float, end: float) -> None:
         self._region_export_range = (start, end)
@@ -1953,18 +2092,26 @@ class MainWindow(QMainWindow):
             self._pause_all_added_players()
             self.clip_audio_player.pause()
             _swap_btn_icon(self.play_btn, "play")
+            self._play_region = None
             return
         # Need at least one clip OR one added-audio entry to play.
         if not self._clips and not self._added_audios:
             return
-        # If we're at the very end, rewind to 0 so hitting play again replays.
-        total = self._total_playback_length()
-        if self.timeline.playhead() >= total - 1e-3:
-            self.timeline.set_playhead(0.0, emit=False)
+        # If a region is selected, play only that region.
+        sel_s = self.timeline._sel_start
+        sel_e = self.timeline._sel_end
+        if sel_e > sel_s:
+            self._play_region = (sel_s, sel_e)
+            if self.timeline.playhead() < sel_s or self.timeline.playhead() >= sel_e - 1e-3:
+                self.timeline.set_playhead(sel_s, emit=False)
+        else:
+            self._play_region = None
+            total = self._total_playback_length()
+            if self.timeline.playhead() >= total - 1e-3:
+                self.timeline.set_playhead(0.0, emit=False)
         self._update_audio_volumes()
         self._play_last_wall = time.monotonic()
         self._play_timer.start()
-        # Align main + aux players to the current playhead before the first tick.
         self._drive_main_player_from_playhead()
         self._sync_clip_audio_playback()
         self._sync_added_audio_playback()
@@ -1973,7 +2120,7 @@ class MainWindow(QMainWindow):
     def _total_playback_length(self) -> float:
         clip_end = sequence_length(self._clips)
         audio_end = max(
-            (a.offset + a.duration for a in self._added_audios), default=0.0,
+            (a.timeline_end for a in self._added_audios), default=0.0,
         )
         return max(clip_end, audio_end)
 
@@ -1982,12 +2129,20 @@ class MainWindow(QMainWindow):
         dt = now - self._play_last_wall
         self._play_last_wall = now
         new_t = self.timeline.playhead() + dt
-        total = self._total_playback_length()
-        if total > 0 and new_t >= total:
-            new_t = total
-            self.timeline.set_playhead(new_t, emit=False)
-            self._toggle_play()
-            return
+        if self._play_region is not None:
+            end = self._play_region[1]
+            if new_t >= end:
+                new_t = end
+                self.timeline.set_playhead(new_t, emit=False)
+                self._toggle_play()
+                return
+        else:
+            total = self._total_playback_length()
+            if total > 0 and new_t >= total:
+                new_t = total
+                self.timeline.set_playhead(new_t, emit=False)
+                self._toggle_play()
+                return
         self.timeline.set_playhead(new_t, emit=False)
         self._drive_main_player_from_playhead()
         self._sync_clip_audio_playback()
@@ -2134,8 +2289,7 @@ class MainWindow(QMainWindow):
 
     def _sync_added_audio_playback(self) -> None:
         """Walk every added-audio entry and start/pause its player based on
-        whether the playhead is inside that entry's [offset, offset+duration]
-        range."""
+        whether the playhead is inside that entry's visible range."""
         if not self._is_playing():
             self._pause_all_added_players()
             return
@@ -2145,10 +2299,11 @@ class MainWindow(QMainWindow):
             if player is None or audio.duration <= 0:
                 continue
             start = audio.offset
-            end = audio.offset + audio.duration
+            end = audio.timeline_end
             in_range = start <= t < end
             if in_range:
-                target_ms = int(max(0.0, t - start) * 1000)
+                src_t = audio.src_start + (t - start)
+                target_ms = int(max(0.0, src_t) * 1000)
                 playing = (
                     player.playbackState() == QMediaPlayer.PlayingState
                 )
@@ -2363,6 +2518,23 @@ class MainWindow(QMainWindow):
         self._snapshot()
         audio.offset = max(0.0, float(offset))
         self._sync_added_audio_playback()
+        self._update_controls_enabled()
+
+    def _on_added_audio_range_changed(self, audio_id: str) -> None:
+        self._snapshot()
+        tl_audio = next(
+            (a for a in self.timeline._added_audios if a.id == audio_id), None,
+        )
+        app_audio = next(
+            (a for a in self._added_audios if a.id == audio_id), None,
+        )
+        if tl_audio is not None and app_audio is not None:
+            app_audio.src_start = tl_audio.src_start
+            app_audio.src_end = tl_audio.src_end
+            app_audio.offset = tl_audio.offset
+        self._refresh_added_audio_display()
+        self._sync_added_audio_playback()
+        self._update_controls_enabled()
 
     def _on_added_audio_delete_requested(self, audio_id: str) -> None:
         if audio_id:
@@ -2386,7 +2558,7 @@ class MainWindow(QMainWindow):
             offset = initial_offset
         else:
             offset = max(
-                (a.offset + a.duration for a in self._added_audios if a.lane == lane),
+                (a.timeline_end for a in self._added_audios if a.lane == lane),
                 default=0.0,
             )
         audio = AddedAudio(path=path, duration=dur, offset=offset, lane=int(lane))
@@ -2588,7 +2760,8 @@ class MainWindow(QMainWindow):
                     volume=vol,
                     original_volume=orig_vol,
                     offset=audio.offset,
-                    duration=audio.duration,
+                    duration=audio.src_span,
+                    src_start=audio.src_start,
                 )
             )
 
@@ -2702,18 +2875,40 @@ class MainWindow(QMainWindow):
     def _update_controls_enabled(self) -> None:
         loaded = bool(self._clips)
         has_any = loaded or bool(self._added_audios)
-        # Play button is enabled whenever there's anything on the timeline —
-        # audio-only sequences are valid too.
         self.play_btn.setEnabled(has_any)
-        for w in (
-            self.split_btn, self.merge_btn, self.delete_clip_btn,
-            self.crop_btn, self.format_combo, self.export_btn,
-        ):
+        for w in (self.crop_btn, self.format_combo, self.export_btn):
             w.setEnabled(loaded)
-        # Zoom controls only make sense when there's something on the
-        # timeline to zoom into.
+        for w in (self.split_btn, self.delete_clip_btn):
+            w.setEnabled(has_any)
+        self.merge_btn.setEnabled(self._can_merge())
         for w in (self.zoom_slider, self.zoom_out_btn, self.zoom_in_btn):
             w.setEnabled(has_any)
+
+    def _can_merge(self) -> bool:
+        sel_audio_id = self.timeline._added_audio_selected_id
+        if sel_audio_id:
+            audio = next((a for a in self._added_audios if a.id == sel_audio_id), None)
+            if audio is not None:
+                return self._has_mergeable_audio_neighbour(audio)
+        c = self._selected_clip() or (
+            clip_at_timeline(self._clips, self.timeline.playhead())
+            if self._clips else None
+        )
+        if c is not None:
+            return bool(self._available_merge_directions(c))
+        return False
+
+    def _has_mergeable_audio_neighbour(self, audio: AddedAudio) -> bool:
+        for a in self._added_audios:
+            if a.id == audio.id or a.path != audio.path or a.lane != audio.lane:
+                continue
+            if (abs(audio.src_end - a.src_start) < 0.05
+                    and abs(audio.timeline_end - a.offset) < 0.05):
+                return True
+            if (abs(a.src_end - audio.src_start) < 0.05
+                    and abs(a.timeline_end - audio.offset) < 0.05):
+                return True
+        return False
 
     def closeEvent(self, event) -> None:  # noqa: ANN001
         for d in (self._thumb_workers, self._wave_workers, self._added_wave_workers):

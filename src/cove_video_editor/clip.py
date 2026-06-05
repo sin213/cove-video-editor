@@ -15,6 +15,9 @@ class AddedAudio:
     `offset` and plays for its natural `duration` (no looping). `lane`
     controls which audio row it renders on: 0 = Audio Track 1 (sits next to
     clip audio), 1 = Audio Track 2 (dedicated overlay lane).
+
+    `src_start` / `src_end` trim the audible portion within the file, like
+    `Clip.src_start` / `Clip.src_end`. When both are 0 the full file plays.
     """
     path: Path
     duration: float = 0.0
@@ -22,16 +25,35 @@ class AddedAudio:
     peaks: list[float] = field(default_factory=list)
     offset: float = 0.0
     lane: int = 1
+    src_start: float = 0.0
+    src_end: float = 0.0
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def __post_init__(self) -> None:
+        if self.src_end <= 0:
+            self.src_end = self.duration
+
+    @property
+    def src_span(self) -> float:
+        return max(0.001, self.src_end - self.src_start)
+
+    @property
+    def timeline_length(self) -> float:
+        return self.src_span
 
     @property
     def timeline_end(self) -> float:
-        return self.offset + self.duration
+        return self.offset + self.timeline_length
+
+    def src_for_timeline(self, t_timeline: float) -> float:
+        t = max(self.offset, min(self.timeline_end, t_timeline))
+        return self.src_start + (t - self.offset)
 
     def clone(self) -> AddedAudio:
         a = AddedAudio(
             path=self.path, duration=self.duration, rate=self.rate,
             peaks=list(self.peaks), offset=self.offset, lane=self.lane,
+            src_start=self.src_start, src_end=self.src_end,
         )
         a.id = self.id
         return a
@@ -279,6 +301,21 @@ def split_clip(clip: Clip, t_timeline: float) -> Clip | None:
     right.src_end = clip.src_end
     right.timeline_start = t_timeline
     clip.src_end = src_t
+    return right
+
+
+def split_added_audio(audio: AddedAudio, t_timeline: float) -> AddedAudio | None:
+    """Split `audio` at timeline time `t`. Returns the new right-hand piece
+    (the original is trimmed in place), or None if `t` is outside the clip."""
+    if t_timeline <= audio.offset + 0.01 or t_timeline >= audio.timeline_end - 0.01:
+        return None
+    src_t = audio.src_for_timeline(t_timeline)
+    right = audio.clone()
+    right.id = uuid.uuid4().hex[:8]
+    right.src_start = src_t
+    right.src_end = audio.src_end
+    right.offset = t_timeline
+    audio.src_end = src_t
     return right
 
 
