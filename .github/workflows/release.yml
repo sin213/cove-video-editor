@@ -54,44 +54,19 @@ jobs:
           chmod +x scripts/build-release.sh
           bash scripts/build-release.sh
 
-      - name: Generate SHA256 sidecars
-        run: |
-          cd release
-          for f in *.AppImage *.deb; do
-            [ -e "$f" ] || continue
-            sha256sum "$f" > "$f.sha256"
-          done
-          ls -la *.sha256
-
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: linux-appimage
-          path: |
-            release/*.AppImage
-            release/*.AppImage.sha256
+          path: release/*.AppImage
           if-no-files-found: error
 
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: linux-deb
-          path: |
-            release/*.deb
-            release/*.deb.sha256
+          path: release/*.deb
           if-no-files-found: error
-
-      - name: Attach to GitHub Release
-        if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            release/*.AppImage
-            release/*.AppImage.sha256
-            release/*.deb
-            release/*.deb.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: true
 
   build-windows:
     needs: resolve-version
@@ -110,42 +85,40 @@ jobs:
         shell: pwsh
         run: .\build.ps1 -Version $env:VERSION
 
-      - name: Generate SHA256 sidecars
-        shell: bash
-        run: |
-          cd release
-          for f in *-Setup.exe *-Portable.exe; do
-            [ -e "$f" ] || continue
-            sha256sum "$f" > "$f.sha256"
-          done
-          ls -la *.sha256
-
       - name: Upload Setup installer
         uses: actions/upload-artifact@v4
         with:
           name: windows-setup
-          path: |
-            release/*-Setup.exe
-            release/*-Setup.exe.sha256
+          path: release/*-Setup.exe
           if-no-files-found: error
 
       - name: Upload Portable exe
         uses: actions/upload-artifact@v4
         with:
           name: windows-portable
-          path: |
-            release/*-Portable.exe
-            release/*-Portable.exe.sha256
+          path: release/*-Portable.exe
           if-no-files-found: error
 
+  publish:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets and generate checksums
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \) -exec cp {} release/ \;
+          cd release
+          sha256sum * > checksums-sha256.txt
+          cat checksums-sha256.txt
+
       - name: Attach to GitHub Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/*-Setup.exe
-            release/*-Setup.exe.sha256
-            release/*-Portable.exe
-            release/*-Portable.exe.sha256
+          files: release/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
