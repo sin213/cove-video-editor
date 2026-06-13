@@ -15,7 +15,10 @@ if sys.stderr is not None and hasattr(sys.stderr, "fileno"):
         pass
 else:
     try:
-        if sys.platform == "win32":
+        from .portable import is_portable, portable_data_dir
+        if is_portable():
+            log_dir = portable_data_dir("cove-video-editor")
+        elif sys.platform == "win32":
             log_dir = os.path.join(
                 os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
                 "CoveVideoEditor",

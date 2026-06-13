@@ -3010,7 +3010,11 @@ class MainWindow(QMainWindow):
         if not info.asset_url:
             QDesktopServices.openUrl(QUrl(info.release_url))
             return
-        cache = Path(os.path.expanduser("~/.cache/cove-video-editor"))
+        from .portable import is_portable, portable_data_dir
+        if is_portable():
+            cache = Path(portable_data_dir("cove-video-editor")) / "cache"
+        else:
+            cache = Path(os.path.expanduser("~/.cache/cove-video-editor"))
         cache.mkdir(parents=True, exist_ok=True)
         dest = cache / info.asset_name
 
