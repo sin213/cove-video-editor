@@ -944,7 +944,11 @@ class MainWindow(QMainWindow):
         bottom.setContentsMargins(14, 10, 14, 10)
         bottom.setSpacing(12)
         self.format_combo = QComboBox()
-        for key in ff.EXPORT_FORMATS:
+        _audio_sep_added = False
+        for key, spec in ff.EXPORT_FORMATS.items():
+            if spec["vcodec"] is None and not _audio_sep_added:
+                self.format_combo.insertSeparator(self.format_combo.count())
+                _audio_sep_added = True
             self.format_combo.addItem(key)
         self.format_combo.setCurrentText("MP4 (H.264 + AAC)")
         self.format_combo.setMinimumWidth(220)
