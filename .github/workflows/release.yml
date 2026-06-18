@@ -109,13 +109,15 @@ jobs:
         with:
           path: artifacts
 
-      - name: Collect assets and generate checksums
+      - name: Collect assets and generate SHA256 sidecars
         run: |
           mkdir -p release
           find artifacts -type f \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \) -exec cp {} release/ \;
           cd release
-          sha256sum * > checksums-sha256.txt
-          cat checksums-sha256.txt
+          for f in *.exe *.AppImage *.deb; do
+            [ -e "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
+          cat *.sha256
 
       - name: Attach to GitHub Release
         uses: softprops/action-gh-release@v2
