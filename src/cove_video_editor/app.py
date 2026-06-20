@@ -64,6 +64,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QScrollBar,
+    QSizeGrip,
     QSizePolicy,
     QSlider,
     QSpinBox,
@@ -431,6 +432,11 @@ class MainWindow(QMainWindow):
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self._resizer = FramelessResizer(self)
+        # Visible SE-corner resize grip so the user has a discoverable
+        # affordance to grab. FramelessResizer handles invisible edge drag.
+        self._size_grip = QSizeGrip(self)
+        self._size_grip.setFixedSize(16, 16)
+        self._size_grip.raise_()
 
         self._assets: dict[str, MediaAsset] = {}
         # Source QPixmap for each image asset — loaded once on import and
@@ -479,6 +485,13 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(4000, self._check_for_updates_in_background)
 
     # --- frameless window helpers -------------------------------------
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        # Reposition the SE-corner QSizeGrip on every resize so it stays
+        # pinned to the bottom-right of the window.
+        s = self._size_grip.sizeHint()
+        self._size_grip.move(self.width() - s.width(), self.height() - s.height())
 
     def _toggle_maximize(self) -> None:
         if self.isMaximized():
