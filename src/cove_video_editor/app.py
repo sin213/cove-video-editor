@@ -956,18 +956,23 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout(export_bar)
         bottom.setContentsMargins(14, 10, 14, 10)
         bottom.setSpacing(12)
+        self.export_type_combo = QComboBox()
+        self.export_type_combo.addItem("Project")
+        self.export_type_combo.addItem("Audio Only")
+        self.export_type_combo.setCurrentText("Project")
+        self.export_type_combo.currentTextChanged.connect(self._on_export_type_changed)
+
         self.format_combo = QComboBox()
-        _audio_sep_added = False
-        for key, spec in ff.EXPORT_FORMATS.items():
-            if spec["vcodec"] is None and not _audio_sep_added:
-                self.format_combo.insertSeparator(self.format_combo.count())
-                _audio_sep_added = True
-            self.format_combo.addItem(key)
-        self.format_combo.setCurrentText("MP4 (H.264 + AAC)")
         self.format_combo.setMinimumWidth(220)
-        export_lbl = QLabel("EXPORT AS")
+        self._populate_format_combo(False)
+
+        export_lbl = QLabel("EXPORT")
         export_lbl.setObjectName("ExportLabel")
+        as_lbl = QLabel("AS")
+        as_lbl.setObjectName("ExportLabel")
         bottom.addWidget(export_lbl)
+        bottom.addWidget(self.export_type_combo, stretch=0)
+        bottom.addWidget(as_lbl)
         bottom.addWidget(self.format_combo, stretch=0)
 
         self.progress = QProgressBar()
@@ -2751,14 +2756,49 @@ class MainWindow(QMainWindow):
 
     # --- export -------------------------------------------------------
 
+    _AUDIO_FORMAT_ORDER = [
+        "WAV (audio only)",
+        "MP3 (audio only)",
+        "Opus (audio only)",
+        "FLAC (audio only)",
+        "OGG (audio only)",
+        "AAC (audio only)",
+    ]
+
+    def _populate_format_combo(self, audio_only: bool) -> None:
+        previous_signal_state = self.format_combo.blockSignals(True)
+        try:
+            self.format_combo.clear()
+
+            if audio_only:
+                for key in self._AUDIO_FORMAT_ORDER:
+                    if key in ff.EXPORT_FORMATS:
+                        self.format_combo.addItem(key)
+                self.format_combo.setCurrentText("WAV (audio only)")
+            else:
+                for key, spec in ff.EXPORT_FORMATS.items():
+                    if spec["vcodec"] is not None:
+                        self.format_combo.addItem(key)
+                self.format_combo.setCurrentText("MP4 (H.264 + AAC)")
+        finally:
+            self.format_combo.blockSignals(previous_signal_state)
+
+    def _on_export_type_changed(self, _text: str = "") -> None:
+        self._populate_format_combo(
+            self.export_type_combo.currentText() == "Audio Only"
+        )
+
     def _on_export_clicked(self) -> None:
-        if not self._clips:
-            return
         fmt_key = self.format_combo.currentText()
         spec = ff.EXPORT_FORMATS[fmt_key]
+        is_audio_only = spec["vcodec"] is None
+        if not self._clips and not (is_audio_only and self._added_audios):
+            return
         ext = spec["ext"]
-        first = self._clips[0]
-        suggested = str(first.path.with_suffix(f".edited.{ext}"))
+        if self._clips:
+            suggested = str(self._clips[0].path.with_suffix(f".edited.{ext}"))
+        else:
+            suggested = str(self._added_audios[0].path.with_suffix(f".edited.{ext}"))
         out_path, _ = QFileDialog.getSaveFileName(
             self, "Export to…", suggested, f"{ext.upper()} (*.{ext});;All files (*)",
         )

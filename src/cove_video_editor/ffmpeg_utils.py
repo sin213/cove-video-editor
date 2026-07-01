@@ -148,6 +148,7 @@ EXPORT_FORMATS: dict[str, dict] = {
     "GIF (animation)":     {"ext": "gif",  "vcodec": "gif",      "acodec": None,           "extra": []},
     "MP3 (audio only)":    {"ext": "mp3",  "vcodec": None,       "acodec": "libmp3lame",   "extra": ["-q:a", "2"]},
     "WAV (audio only)":    {"ext": "wav",  "vcodec": None,       "acodec": "pcm_s16le",    "extra": []},
+    "Opus (audio only)":   {"ext": "opus", "vcodec": None,       "acodec": "libopus",      "extra": ["-b:a", "128k"]},
     "FLAC (audio only)":   {"ext": "flac", "vcodec": None,       "acodec": "flac",         "extra": []},
     "OGG (audio only)":    {"ext": "ogg",  "vcodec": None,       "acodec": "libvorbis",    "extra": ["-q:a", "5"]},
     "AAC (audio only)":    {"ext": "m4a",  "vcodec": None,       "acodec": "aac",          "extra": ["-b:a", "192k", "-movflags", "+faststart"]},

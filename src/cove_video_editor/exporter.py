@@ -61,7 +61,9 @@ class ExportJob:
 
     @property
     def total_timeline(self) -> float:
-        return sequence_length(self.clips)
+        if self.clips:
+            return sequence_length(self.clips)
+        return _audio_only_duration(self.audio_tracks) if self.audio_tracks else 0.0
 
 
 class ExportWorker(QObject):
@@ -131,21 +133,24 @@ class ExportWorker(QObject):
     def _build_command(self) -> list[str]:
         job = self._job
         clips = sort_clips(job.clips)
-        if not clips:
-            raise RuntimeError("no clips to export")
-
         spec = ff.EXPORT_FORMATS.get(job.fmt_key)
         if spec is None:
             raise RuntimeError(f"unknown format {job.fmt_key!r}")
 
-        # Build the list of segments on the timeline: either a clip, or a gap
-        # (black + silent). Gaps between clips are filled with `color` /
-        # `anullsrc` sources so concat matches.
-        timeline_end = sequence_length(clips)
-        segments = _segments_with_gaps(clips, timeline_end)
-
         is_audio_only = spec["vcodec"] is None
         needs_audio = spec["acodec"] is not None
+
+        # Video/Project export still needs at least one clip. Audio-only
+        # export may run on standalone added-audio tracks with no clips.
+        if not clips and not (is_audio_only and job.audio_tracks):
+            raise RuntimeError("no clips to export")
+
+        # Build the list of segments on the timeline: either a clip, or a gap
+        # (black + silent). Gaps between clips are filled with `color` /
+        # `anullsrc` sources so concat matches. With no clips, this yields a
+        # single silent gap spanning the added-audio duration.
+        timeline_end = sequence_length(clips) if clips else _audio_only_duration(job.audio_tracks)
+        segments = _segments_with_gaps(clips, timeline_end)
 
         # Output size: honor crop, else take from first real clip, else 1280x720
         first_real = next((c for c in clips if c.asset.width > 0), None)
@@ -357,7 +362,10 @@ class ExportWorker(QObject):
         # Added-audio tracks: each placed at its offset, plays for its own
         # duration (padded with silence), then mixed with the clip audio.
         if add_track_indices and needs_audio:
-            total = max(0.01, sequence_length(job.clips))
+            total = (
+                max(0.01, sequence_length(job.clips))
+                if job.clips else _audio_only_duration(job.audio_tracks)
+            )
             extra_labels: list[str] = []
             replace_any = False
             orig_volume = 1.0
@@ -493,6 +501,27 @@ class ExportWorker(QObject):
             alpha = 0.35
             self._eta_smoothed = alpha * eta_raw + (1 - alpha) * self._eta_smoothed
         self.eta.emit(self._eta_smoothed)
+
+
+def _audio_only_duration(audio_tracks: list[AudioTrack]) -> float:
+    """Timeline length for a no-video-clip audio-only export, derived from
+    each added-audio track's placement (offset + span) — the same
+    offset/duration semantics used to place tracks during mixing.
+
+    With no video clips there is no timeline length to fall back on, so a
+    track left at its ``duration <= 0`` ("use full input") default has no
+    resolvable end time here — fail fast instead of guessing a length.
+    """
+    ends = []
+    for t in audio_tracks:
+        if t.duration <= 0:
+            raise RuntimeError(
+                "cannot determine audio-only export duration: added-audio "
+                "track has no explicit duration and there are no video "
+                "clips to derive the timeline length from"
+            )
+        ends.append(max(0.0, t.offset) + t.duration)
+    return max(0.01, max(ends))
 
 
 def _segments_with_gaps(clips: list[Clip], end: float) -> list[tuple[str, float, float, Clip | None]]:

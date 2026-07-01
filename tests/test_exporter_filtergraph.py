@@ -2,7 +2,7 @@ from pathlib import Path
 import unittest
 
 from cove_video_editor.clip import Clip, MediaAsset
-from cove_video_editor.exporter import ExportJob, ExportWorker, _join_filter_labels
+from cove_video_editor.exporter import AudioTrack, ExportJob, ExportWorker, _join_filter_labels
 
 
 def _asset(name: str, *, has_audio: bool, kind: str = "video") -> MediaAsset:
@@ -178,6 +178,37 @@ class ExporterFiltergraphTests(unittest.TestCase):
         self.assertEqual(a_label, "ac")
         self.assertNotIn("[0:a]", graph)
         self.assertIn("anullsrc=channel_layout=stereo:sample_rate=48000", graph)
+
+    def test_audio_only_export_builds_command_with_no_video_clips(self) -> None:
+        """Standalone added-audio (no video clips) can build an audio-only
+        command: no video map/codec, and an audio map to the output path."""
+        track = AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0)
+        job = ExportJob(
+            clips=[], output=Path("out.wav"), fmt_key="WAV (audio only)",
+            audio_tracks=[track],
+        )
+        worker = ExportWorker(job)
+
+        cmd = worker._build_command()
+
+        self.assertNotIn("-c:v", cmd)
+        self.assertEqual(cmd.count("-map"), 1)
+        self.assertIn("-c:a", cmd)
+        self.assertIn("pcm_s16le", cmd)
+        self.assertEqual(cmd[-1], "out.wav")
+
+    def test_project_export_still_rejects_no_clips(self) -> None:
+        """Project/video export must keep rejecting empty timelines, even
+        when added-audio tracks are present."""
+        track = AudioTrack(path=Path("added.mp3"), offset=0.0, duration=2.0)
+        job = ExportJob(
+            clips=[], output=Path("out.mp4"), fmt_key="MP4 (H.264 + AAC)",
+            audio_tracks=[track],
+        )
+        worker = ExportWorker(job)
+
+        with self.assertRaisesRegex(RuntimeError, "no clips to export"):
+            worker._build_command()
 
 
 if __name__ == "__main__":
